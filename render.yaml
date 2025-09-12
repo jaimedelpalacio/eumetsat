@@ -1,0 +1,29 @@
+# render.yaml (opcional) — Solo define el Web Service que usa tu Dockerfile.
+# El CRON lo sigues creando desde el panel.
+
+services:
+  - type: web
+    name: lsa-saf-frp-bridge
+    env: docker                 # usa el Dockerfile del repo
+    dockerfilePath: ./Dockerfile
+    plan: pro                   # ya que tu servicio está en PRO
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      # Secrets (defínelos en el panel → Secrets; aquí solo referencias)
+      - key: LSASAF_USER
+        fromSecret: LSASAF_USER
+      - key: LSASAF_PASS
+        fromSecret: LSASAF_PASS
+      - key: API_KEY
+        fromSecret: BRIDGE_API_KEY
+
+      # Config por defecto (puedes sobreescribirlas en el panel)
+      - key: LAG_MIN
+        value: "30"
+      - key: FALLBACKS
+        value: "2"
+      - key: IBERIA_BBOX
+        value: "-9.5,35.5,3.5,44.5"
+      - key: HTTP_TIMEOUT
+        value: "60"

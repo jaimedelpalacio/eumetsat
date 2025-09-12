@@ -1,0 +1,5 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+requests==2.32.3
+h5py==3.11.0
+orjson==3.10.7
