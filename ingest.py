@@ -1,11 +1,17 @@
-"""
-ingest.py — Lógica de ingesta/parseo y doble buffer en RAM.
-
-- Mantiene dos snapshots globales en memoria: 'current' (último válido) y 'previous' (penúltimo).
-- 'reload_latest_async()' descarga, valida, parsea y, si es correcto, conmute current/previous de forma atómica.
-- 'get_snapshot_for_serve()' expone el snapshot para servirlo (current > previous).
-- 'ingest_slot_by_ts_async()' procesa un slot concreto a demanda (sin tocar el buffer).
-"""
+# ingest.py — Microservicio LSA SAF FRP-PIXEL → JSON (doble buffer en RAM)
+# -----------------------------------------------------------------------------
+# Qué hace:
+#  - Descarga ficheros HDF5 del producto FRP-PIXEL (Meteosat, LSA SAF) vía HTTP Basic Auth.
+#  - Parsea la lista de detecciones (ListProduct) de forma robusta:
+#       1) por nombres (regex) y
+#       2) si no encuentra nada, heurística “flex” por rangos/longitudes.
+#  - Filtra por BBOX Iberia (por defecto) y devuelve JSON con metadatos.
+#  - Mantiene en memoria dos snapshots: current (último válido) y previous (penúltimo).
+#  - Expone funciones para FastAPI: startup_warmup, reload_latest_async,
+#    get_snapshot_for_serve, ingest_slot_by_ts_async y la constante DEFAULT_IBERIA_BBOX.
+# -----------------------------------------------------------------------------
+# NOTA: Este fichero está listo para reemplazar tu ingest.py actual (drop-in).
+#       No requiere cambios en app.py (si usas el que te pasé).
 
 import os
 import io
@@ -22,24 +28,31 @@ import h5py
 # Configuración por entorno
 # ==========================
 
-# Margen para calcular "último slot" (en minutos). 30 reduce 404 por latencia.
+# Margen (min) para calcular “slot candidato” si lo necesitas en otras partes (no imprescindible aquí).
 LAG_MIN = int(os.getenv("LAG_MIN", "30"))
 
 # BBOX Iberia por defecto (w,s,e,n). Ajusta si quieres incluir/excluir zonas.
-DEFAULT_IBERIA_BBOX = tuple(map(float, os.getenv("IBERIA_BBOX", "-9.5,35.5,3.5,44.5").split(",")))
+DEFAULT_IBERIA_BBOX: Tuple[float, float, float, float] = tuple(
+    map(float, os.getenv("IBERIA_BBOX", "-9.5,35.5,3.5,44.5").split(","))
+)  # type: ignore
 
 # Credenciales LSA SAF (Basic Auth). Se usan solo desde el servidor.
 LSASAF_USER = os.getenv("LSASAF_USER", "")
 LSASAF_PASS = os.getenv("LSASAF_PASS", "")
 
-# Intentos de fallback si 404: t, t-15, t-30 (FALLBACKS=2)
-FALLBACKS = int(os.getenv("FALLBACKS", "2"))
+# Intentos de fallback si el último slot aún no está publicado: t, t-15, t-30, …
+FALLBACKS = int(os.getenv("FALLBACKS", "6"))  # p.ej. 6 = cubre 90 minutos
 
-# Timeout de red (seg)
+# Timeout de red (segundos)
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "60"))
 
 # Host LSA SAF (HDF5 FRP-PIXEL)
 LSA_HOST = "https://datalsasaf.lsasvcs.ipma.pt"
+
+# Variante del producto que construye el nombre de fichero:
+#   - "ListProduct" (recomendado; contiene la lista de detecciones)
+#   - "QualityProduct" (banderas/calidad; NO trae la lista de puntos)
+FRP_VARIANT = os.getenv("FRP_VARIANT", "ListProduct")
 
 
 # =========================================
@@ -48,7 +61,7 @@ LSA_HOST = "https://datalsasaf.lsasvcs.ipma.pt"
 
 _current: Optional[Dict[str, Any]] = None
 _previous: Optional[Dict[str, Any]] = None
-_lock = asyncio.Lock()  # protege las conmutaciones y lecturas/actualizaciones
+_lock = asyncio.Lock()  # asegura conmutaciones atómicas
 
 
 # ==========================
@@ -74,12 +87,12 @@ def _candidate_ts_list(now_utc: Optional[dt.datetime] = None) -> List[str]:
     Genera la lista de timestamps candidatos, de más reciente a más antiguo:
     - Primero el slot actual (UTC redondeado al cuarto de hora).
     - Luego retrocede en pasos de 15 min hasta 'FALLBACKS'.
-    Devuelve 'out' para ser drop-in con tu versión anterior.
+    Mantiene 'return out' para ser sustitución directa.
     """
     if now_utc is None:
         now_utc = dt.datetime.utcnow()
 
-    base = _floor_to_quarter(now_utc)  # p.ej., 15:30, 15:45, etc. (UTC)
+    base = _floor_to_quarter(now_utc)  # p. ej., 15:30, 15:45, etc. (UTC)
     out: List[str] = []
     for i in range(0, FALLBACKS + 1):
         ti = base - dt.timedelta(minutes=15 * i)
@@ -88,11 +101,11 @@ def _candidate_ts_list(now_utc: Optional[dt.datetime] = None) -> List[str]:
     return out
 
 
-
 def _build_url_from_ts(ts: str) -> str:
-    """Construye la URL determinista del HDF5 FRP-PIXEL a partir del TS."""
-    yyyy, mm, dd, hh, mi = ts[:4], ts[4:6], ts[6:8], ts[8:10], ts[10:12]
-    path = f"/PRODUCTS/MSG/FRP-PIXEL/HDF5/{yyyy}/{mm}/{dd}/HDF5_LSASAF_MSG_FRP-PIXEL-ListProduct_MSG-Disk_{ts}"
+    """URL del HDF5 FRP-PIXEL para el timestamp y la variante elegida."""
+    yyyy, mm, dd = ts[:4], ts[4:6], ts[6:8]
+    fname = f"HDF5_LSASAF_MSG_FRP-PIXEL-{FRP_VARIANT}_MSG-Disk_{ts}"
+    path = f"/PRODUCTS/MSG/FRP-PIXEL/HDF5/{yyyy}/{mm}/{dd}/{fname}"
     return f"{LSA_HOST}{path}"
 
 
@@ -125,75 +138,15 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _flatten(x):
-    """Convierte arrays de h5py (incl. Nx1) a listas nativas de Python."""
-    try:
-        import numpy as np  # opcional, por si está presente
-        arr = np.array(x)
-        return arr.reshape(-1).tolist()
-    except Exception:
-        # Sin numpy: convertir con list() y aplanar lo básico
-        try:
-            return [v for v in x]
-        except Exception:
-            return []
+def _slot_iso_from_ts(ts: str) -> str:
+    """Convierte YYYYMMDDHHMM (UTC) a ISO Z."""
+    d = dt.datetime.strptime(ts, "%Y%m%d%H%M")
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
-    """
-    Parsea el HDF5 de FRP-PIXEL de forma robusta (descubre datasets por nombre).
-    Devuelve un dict con 'rows': lista de detecciones.
-    """
-    with h5py.File(io.BytesIO(h5bytes), "r") as f:
-        paths: List[str] = []
-        f.visit(paths.append)
-
-        def find_one(regex_list: List[str]):
-            for p in paths:
-                for rg in regex_list:
-                    if re.search(rg, p, re.IGNORECASE):
-                        try:
-                            return f[p][:]
-                        except Exception:
-                            pass
-            return None
-
-        # Buscamos datasets habituales por regex tolerantes
-        lat = find_one([r"/lat(i(tude)?)?$", r"/.*lat$"])
-        lon = find_one([r"/lon(g(i(tude)?)?)?$", r"/.*lon$"])
-        frp = find_one([r"/frp(?!.*grid)"])
-        unc = find_one([r"/frp_?unc(|_mw)?$", r"/uncert"])
-        conf = find_one([r"/conf(idence)?$"])
-        area = find_one([r"/(pixel_)?area"])
-        tim = find_one([r"/time"])
-
-        # Aplanamos a listas
-        latL = _flatten(lat) if lat is not None else []
-        lonL = _flatten(lon) if lon is not None else []
-        frpL = _flatten(frp) if frp is not None else []
-        uncL = _flatten(unc) if unc is not None else []
-        confL = _flatten(conf) if conf is not None else []
-        areaL = _flatten(area) if area is not None else []
-        timL = _flatten(tim) if tim is not None else []
-
-        n = max(len(latL), len(lonL), len(frpL), len(uncL), len(confL), len(areaL), len(timL), 0)
-
-        rows: List[Dict[str, Any]] = []
-        for i in range(n):
-            rows.append(
-                {
-                    "lat": float(latL[i]) if i < len(latL) else None,
-                    "lon": float(lonL[i]) if i < len(lonL) else None,
-                    "frp_mw": float(frpL[i]) if i < len(frpL) else None,
-                    "frp_unc_mw": float(uncL[i]) if i < len(uncL) else None,
-                    "confidence": float(confL[i]) if i < len(confL) else None,
-                    "pixel_km2": float(areaL[i]) if i < len(areaL) else None,
-                    "time_raw": float(timL[i]) if i < len(timL) else None,
-                }
-            )
-
-        return {"rows": rows}
-
+# ==========================
+# Filtrado y umbrales
+# ==========================
 
 def _filter_bbox(rows: List[Dict[str, Any]], bbox: Tuple[float, float, float, float]) -> List[Dict[str, Any]]:
     """Filtra por BBOX (w,s,e,n)."""
@@ -222,10 +175,251 @@ def _apply_thresholds(
     return out
 
 
-def _slot_iso_from_ts(ts: str) -> str:
-    """Convierte YYYYMMDDHHMM (UTC) a ISO Z."""
-    d = dt.datetime.strptime(ts, "%Y%m%d%H%M")
-    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+# ==========================
+# Parser HDF5 robusto
+# ==========================
+
+def _flatten_1d_to_list(x) -> List[float]:
+    """
+    Aplana datasets 1D a lista de float sin depender de numpy.
+    Si la entrada es escalar o multidimensional, devuelve lista vacía.
+    """
+    try:
+        # h5py Dataset: acceso con [:] si 1D
+        if hasattr(x, "shape"):
+            if len(x.shape) != 1 or x.shape[0] == 0:
+                return []
+            return [float(v) for v in x[:]]
+        # memoria ya cargada (lista/tupla)
+        if isinstance(x, (list, tuple)):
+            return [float(v) for v in x]
+    except Exception:
+        pass
+    return []
+
+
+def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
+    """
+    Parsea el HDF5 de FRP-PIXEL.
+    - 1º: intenta localizar datasets por nombre (regex).
+    - 2º: si no hay filas, fallback “flex” que inspecciona datasets 1D
+         y detecta lat/lon/FRP por heurística de rangos/valores.
+    Devuelve dict con 'rows': lista de detecciones.
+    """
+    def _by_regex(f: h5py.File) -> Dict[str, Any]:
+        paths: List[str] = []
+        f.visit(paths.append)
+
+        def find_one(regex_list: List[str]):
+            for p in paths:
+                for rg in regex_list:
+                    if re.search(rg, p, re.IGNORECASE):
+                        try:
+                            return f[p]
+                        except Exception:
+                            pass
+            return None
+
+        lat = find_one([r"/lat(i(tude)?)?$", r"/(?:^|/)lat$"])
+        lon = find_one([r"/lon(g(i(tude)?)?)?$", r"/(?:^|/)lon$"])
+        frp = find_one([r"/frp(?!.*grid)"])
+        unc = find_one([r"/frp_?unc(|_mw)?$", r"/uncert"])
+        conf = find_one([r"/conf(idence)?$"])
+        area = find_one([r"/(pixel_)?area"])
+        tim = find_one([r"/time"])
+
+        latL = _flatten_1d_to_list(lat) if lat is not None else []
+        lonL = _flatten_1d_to_list(lon) if lon is not None else []
+        frpL = _flatten_1d_to_list(frp) if frp is not None else []
+        uncL = _flatten_1d_to_list(unc) if unc is not None else []
+        confL = _flatten_1d_to_list(conf) if conf is not None else []
+        areaL = _flatten_1d_to_list(area) if area is not None else []
+        timL = _flatten_1d_to_list(tim) if tim is not None else []
+
+        n = max(len(latL), len(lonL), len(frpL), len(uncL), len(confL), len(areaL), len(timL), 0)
+        if n == 0:
+            return {"rows": []}
+
+        rows: List[Dict[str, Any]] = []
+        for i in range(n):
+            rows.append(
+                {
+                    "lat": float(latL[i]) if i < len(latL) else None,
+                    "lon": float(lonL[i]) if i < len(lonL) else None,
+                    "frp_mw": float(frpL[i]) if i < len(frpL) else None,
+                    "frp_unc_mw": float(uncL[i]) if i < len(uncL) else None,
+                    "confidence": float(confL[i]) if i < len(confL) else None,
+                    "pixel_km2": float(areaL[i]) if i < len(areaL) else None,
+                    "time_raw": float(timL[i]) if i < len(timL) else None,
+                }
+            )
+        return {"rows": rows}
+
+    def _by_flex(f: h5py.File) -> Dict[str, Any]:
+        """
+        Heurístico sin numpy:
+        - Recorre datasets 1D numéricos y los agrupa por longitud.
+        - En el grupo de mayor longitud intenta:
+            * lat: % valores en [-90, 90] (desempate por nombre)
+            * lon: % valores en [-180, 180] (desempate por nombre)
+            * frp: proporción de valores >= 0 y existencia de alguno > 0 (desempate por nombre)
+            * time: secuencia con más “incrementos” (monotonía parcial)
+        """
+        # Colección de candidatos 1D
+        cands: List[Tuple[str, List[float]]] = []
+
+        def _is_numeric_dtype(d: Any) -> bool:
+            s = str(d)
+            # tipos numéricos habituales en h5py
+            return any(k in s for k in ("int", "float", "i1", "i2", "i4", "i8", "f4", "f8"))
+
+        def _visitor(name, obj):
+            if isinstance(obj, h5py.Dataset) and obj.ndim == 1 and obj.size > 0 and _is_numeric_dtype(obj.dtype):
+                try:
+                    # Limitamos muestra para memoria/velocidad si fuera enorme
+                    m = min(obj.size, 500000)  # hasta 5e5 elementos
+                    vals = [float(v) for v in obj[:m]]
+                    cands.append((name, vals))
+                except Exception:
+                    pass
+
+        f.visititems(_visitor)
+        if not cands:
+            return {"rows": []}
+
+        # Agrupa por longitud (preferimos la mayor)
+        groups: Dict[int, List[Tuple[str, List[float]]]] = {}
+        for name, arr in cands:
+            groups.setdefault(len(arr), []).append((name, arr))
+        length = max(groups.keys())
+        group = groups[length]
+
+        def frac_in_range(a: List[float], lo: float, hi: float) -> float:
+            total = 0
+            ok = 0
+            for v in a:
+                if v == v:  # no NaN
+                    total += 1
+                    if lo <= v <= hi:
+                        ok += 1
+            return (ok / total) if total else 0.0
+
+        def some_positive(a: List[float]) -> bool:
+            for v in a:
+                if v == v and v > 0:
+                    return True
+            return False
+
+        def nonneg_fraction(a: List[float]) -> float:
+            total = 0
+            ok = 0
+            for v in a:
+                if v == v:
+                    total += 1
+                    if v >= 0:
+                        ok += 1
+            return (ok / total) if total else 0.0
+
+        def name_score(n: str, keys: List[str]) -> float:
+            nlow = n.lower()
+            return 1.0 if any(k in nlow for k in keys) else 0.0
+
+        # Selección de lat/lon
+        best_lat = (-1.0, -1)
+        best_lon = (-1.0, -1)
+        for i, (n, a) in enumerate(group):
+            sc = frac_in_range(a, -90, 90) + 0.1 * name_score(n, ["lat"])
+            if sc > best_lat[0]:
+                best_lat = (sc, i)
+        for i, (n, a) in enumerate(group):
+            sc = frac_in_range(a, -180, 180) + 0.1 * name_score(n, ["lon"])
+            if sc > best_lon[0]:
+                best_lon = (sc, i)
+
+        lat_arr = group[best_lat[1]][1] if best_lat[1] >= 0 else None
+        lon_arr = group[best_lon[1]][1] if best_lon[1] >= 0 else None
+
+        # Selección de FRP
+        best_frp = (-1.0, -1)
+        for i, (n, a) in enumerate(group):
+            if some_positive(a):
+                sc = nonneg_fraction(a) + 0.05 * name_score(n, ["frp"])
+                if sc > best_frp[0]:
+                    best_frp = (sc, i)
+        frp_arr = group[best_frp[1]][1] if best_frp[1] >= 0 else None
+
+        # Selección de time (monotonía parcial)
+        def inc_score(a: List[float], k: int = 2048) -> float:
+            # cuenta incrementos sobre una ventana
+            k = min(k, len(a) - 1) if len(a) > 1 else 0
+            if k <= 0:
+                return 0.0
+            inc = 0
+            prev = a[0]
+            for i in range(1, k + 1):
+                cur = a[i]
+                if cur == cur and prev == prev and cur >= prev:
+                    inc += 1
+                prev = cur
+            return float(inc)
+
+        best_t = (-1.0, -1)
+        for i, (n, a) in enumerate(group):
+            sc = inc_score(a) + 0.05 * name_score(n, ["time", "tstamp", "date"])
+            if sc > best_t[0]:
+                best_t = (sc, i)
+        time_arr = group[best_t[1]][1] if best_t[1] >= 0 else None
+
+        # Si no hay nada identificable, devolvemos vacío
+        if lat_arr is None and lon_arr is None and frp_arr is None:
+            return {"rows": []}
+
+        rows: List[Dict[str, Any]] = []
+        for i in range(length):
+            rows.append(
+                {
+                    "lat": float(lat_arr[i]) if lat_arr is not None else None,
+                    "lon": float(lon_arr[i]) if lon_arr is not None else None,
+                    "frp_mw": float(frp_arr[i]) if frp_arr is not None else None,
+                    "frp_unc_mw": None,
+                    "confidence": None,
+                    "pixel_km2": None,
+                    "time_raw": float(time_arr[i]) if time_arr is not None and i < len(time_arr) else None,
+                }
+            )
+        return {"rows": rows}
+
+    with h5py.File(io.BytesIO(h5bytes), "r") as f:
+        byname = _by_regex(f)
+        if byname["rows"]:
+            return byname
+        # Fallback: flex
+        return _by_flex(f)
+
+
+def _h5_datasets_summary(h5bytes: bytes, sample: int = 3) -> List[Dict[str, Any]]:
+    """
+    Devuelve un resumen de datasets del HDF5: path, shape, dtype y muestra de valores (si 1D).
+    Útil para diagnóstico (/by-ts?debug=1).
+    """
+    out: List[Dict[str, Any]] = []
+    with h5py.File(io.BytesIO(h5bytes), "r") as f:
+        def _visitor(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                info = {
+                    "path": name,
+                    "shape": tuple(obj.shape),
+                    "dtype": str(obj.dtype),
+                }
+                try:
+                    if obj.ndim == 1 and obj.size > 0:
+                        m = min(sample, obj.size)
+                        info["sample"] = [float(v) for v in obj[:m]]
+                except Exception:
+                    pass
+                out.append(info)
+        f.visititems(_visitor)
+    return out
 
 
 # ==================================
@@ -241,7 +435,7 @@ def _build_snapshot(ts: str, h5bytes: bytes, bbox_used: Tuple[float, float, floa
     iso = _slot_iso_from_ts(ts)
     sha = _sha256(h5bytes)
 
-    snap = {
+    snap: Dict[str, Any] = {
         "slot_ts": iso,
         "downloaded_at": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "bbox_used": list(bbox_used),
@@ -256,8 +450,6 @@ def _build_snapshot(ts: str, h5bytes: bytes, bbox_used: Tuple[float, float, floa
 
 def get_snapshot_for_serve() -> Optional[Dict[str, Any]]:
     """Devuelve current si hay; si no, previous; si no, None."""
-    # No requiere lock para lectura simple (lecturas de referencias son atómicas en CPython),
-    # pero si quieres máxima seguridad, puedes envolver en lock.
     return _current or _previous
 
 
@@ -267,9 +459,9 @@ async def reload_latest_async() -> Dict[str, Any]:
     Reglas:
       - Monotonía: no reemplazar por slots más antiguos.
       - Idempotencia: si sha256 coincide, no conmuta.
-      - Sanidad: no aceptar vacíos si antes teníamos datos (opcional).
+      - Sanidad: no aceptar vacíos si antes había datos (opcional).
     """
-    global _current, _previous  # <-- DECLARAR GLOBAL ANTES DE USARLAS
+    global _current, _previous  # <-- IMPORTANTE: antes de usar
 
     async with _lock:
         now = dt.datetime.utcnow()
@@ -283,17 +475,20 @@ async def reload_latest_async() -> Dict[str, Any]:
                 h5 = _download_hdf5(url)
                 new_snap = _build_snapshot(ts, h5, DEFAULT_IBERIA_BBOX)
 
-                # Monotonía
-                if _current:
-                    cur_ts = _current["slot_ts"]
-                    if new_snap["slot_ts"] < cur_ts:
-                        return {"ok": False, "reason": "older_slot", "tried": tried, "chosen": ts}
+                # Monotonía: no retroceder en el tiempo
+                if _current and new_snap["slot_ts"] < _current["slot_ts"]:
+                    continue
 
                 # Idempotencia
                 if _current and new_snap["sha256"] == _current.get("sha256"):
-                    return {"ok": True, "reason": "not_changed", "slot_ts": new_snap["slot_ts"], "count": new_snap["count"]}
+                    return {
+                        "ok": True,
+                        "reason": "not_changed",
+                        "slot_ts": new_snap["slot_ts"],
+                        "count": new_snap["count"],
+                    }
 
-                # Sanidad (opcional): no aceptar vacío si antes había datos
+                # Sanidad (opcional): evita vacíos si antes había filas
                 if _current and new_snap["count"] == 0 and _current["count"] > 0:
                     last_err = "candidate_empty_rejected"
                     continue
@@ -302,7 +497,13 @@ async def reload_latest_async() -> Dict[str, Any]:
                 _previous = _current
                 _current = new_snap
 
-                return {"ok": True, "reason": "swapped", "slot_ts": new_snap["slot_ts"], "count": new_snap["count"], "url": url}
+                return {
+                    "ok": True,
+                    "reason": "swapped",
+                    "slot_ts": new_snap["slot_ts"],
+                    "count": new_snap["count"],
+                    "url": url,
+                }
 
             except FileNotFoundError:
                 last_err = "404"
@@ -315,12 +516,12 @@ async def reload_latest_async() -> Dict[str, Any]:
         return {"ok": False, "reason": last_err or "unknown", "tried": tried}
 
 
-
 async def ingest_slot_by_ts_async(
     ts: str,
     bbox: Optional[Tuple[float, float, float, float]] = None,
     min_frp: Optional[float] = None,
     min_conf: Optional[float] = None,
+    debug: bool = False,
 ) -> Dict[str, Any]:
     """
     Procesa un TS concreto bajo demanda y devuelve JSON (NO altera el buffer en RAM).
@@ -347,7 +548,7 @@ async def ingest_slot_by_ts_async(
     # Umbrales opcionales
     rows = _apply_thresholds(rows, min_frp=min_frp, min_conf=min_conf)
 
-    return {
+    resp: Dict[str, Any] = {
         "ok": True,
         "slot_ts": _slot_iso_from_ts(ts),
         "downloaded_at": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -357,6 +558,11 @@ async def ingest_slot_by_ts_async(
         "sha256": _sha256(h5),
         "rows": rows,
     }
+
+    if debug:
+        resp["datasets"] = _h5_datasets_summary(h5, sample=3)
+
+    return resp
 
 
 async def startup_warmup():
@@ -368,5 +574,3 @@ async def startup_warmup():
     except Exception:
         # Silencioso: el cron del panel reintenta en minutos
         pass
-
-
