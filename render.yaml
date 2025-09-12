@@ -22,8 +22,9 @@ services:
       - key: LAG_MIN
         value: "30"
       - key: FALLBACKS
-        value: "2"
+        value: "8"
       - key: IBERIA_BBOX
         value: "-9.5,35.5,3.5,44.5"
       - key: HTTP_TIMEOUT
         value: "60"
+
