@@ -244,17 +244,30 @@ def _filter_bbox(rows: List[Dict[str, Any]], bbox: Tuple[float, float, float, fl
     return out
 
 def _apply_thresholds(rows: List[Dict[str, Any]], min_frp: Optional[float], min_conf: Optional[float]) -> List[Dict[str, Any]]:
-    """Aplica filtros por mínimos (si se dan)."""
+    """Aplica filtros por mínimos (si se dan).
+    - FRP en MW.
+    - Confianza admite 0–1 o 0–100 (normalizamos si viene en porcentaje).
+    """
     out = []
+    # Normalizamos confianza si viene en 0–100
+    thr_conf = None
+    if min_conf is not None:
+        thr_conf = float(min_conf)
+        if thr_conf > 1.0:  # p.ej. 90 → 0.90
+            thr_conf /= 100.0
+
+    thr_frp = float(min_frp) if min_frp is not None else None
+
     for r in rows:
         frp = r.get("frp_mw")
         conf = r.get("confidence")
-        if min_frp is not None and (frp is None or frp < min_frp):
+        if thr_frp is not None and (frp is None or float(frp) < thr_frp):
             continue
-        if min_conf is not None and (conf is None or conf < min_conf):
+        if thr_conf is not None and (conf is None or float(conf) < thr_conf):
             continue
         out.append(r)
     return out
+
 
 # --------------------------- Validaciones slot ----------------------------
 
@@ -430,5 +443,6 @@ async def startup_warmup():
     except Exception:
         # Silencioso: el cron hará /reload en minutos
         pass
+
 
 
