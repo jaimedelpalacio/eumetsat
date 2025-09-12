@@ -42,10 +42,10 @@ LSA_HOST = os.getenv("LSA_HOST", "https://datalsasaf.lsasvcs.ipma.pt")
 FRP_VARIANT = os.getenv("FRP_VARIANT", "ListProduct")
 
 # Minutos de margen para que el último slot esté publicado (evita race).
-LAG_MIN = int(os.getenv("LAG_MIN", "10"))
+LAG_MIN = int(os.getenv("LAG_MIN", "30"))
 
 # Intentos de fallback: t, t-15, t-30, ... (6 ⇒ 90 minutos hacia atrás).
-FALLBACKS = int(os.getenv("FALLBACKS", "6"))
+FALLBACKS = int(os.getenv("FALLBACKS", "8"))
 
 # Timeout de red (segundos).
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
@@ -420,3 +420,4 @@ async def startup_warmup():
     except Exception:
         # Silencioso: el cron hará /reload en minutos
         pass
+
