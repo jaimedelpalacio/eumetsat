@@ -260,29 +260,34 @@ def _apply_thresholds(rows: List[Dict[str, Any]], min_frp: Optional[float], min_
 
 def _sanity_checks(rows: List[Dict[str, Any]]) -> Tuple[bool, str]:
     """
-    Sanidad mínima para aceptar un slot:
-    - ≥ 1 fila tras parseo.
-    - FRP no constante en todas las filas.
-    - Coordenadas con decimales en algún % (evita enteros discretizados).
+    Sanidad mínima para aceptar un slot (sobre el conjunto GLOBAL):
+    - ≥ 1 fila con lat, lon y frp.
+    - Si hay ≥3 filas: FRP no debe ser constante en todas.
+    - (Opcional) Chequeo ligero de decimales cuando hay suficientes filas.
     """
-    if not rows:
+    # Filas válidas con los tres campos presentes
+    valid = [r for r in rows if r.get("frp_mw") is not None
+                         and r.get("latitude") is not None
+                         and r.get("longitude") is not None]
+    if not valid:
         return False, "sin_filas"
-    frps = [r["frp_mw"] for r in rows if r.get("frp_mw") is not None]
-    if not frps:
-        return False, "frp_vacios"
-    if len(set(round(x, 3) for x in frps)) == 1:
+
+    frps = [float(r["frp_mw"]) for r in valid]
+    if len(frps) >= 3 and len(set(round(x, 3) for x in frps)) == 1:
         return False, "frp_constante"
-    # Chequeo rápido de decimales en lat/lon
-    any_dec = False
-    for r in rows[:50]:
-        la, lo = r.get("latitude"), r.get("longitude")
-        if la is not None and lo is not None:
-            if (abs(la - round(la)) > 1e-6) or (abs(lo - round(lo)) > 1e-6):
-                any_dec = True
-                break
-    if not any_dec:
-        return False, "coord_sin_decimales"
+
+    # Solo tiene sentido mirar decimales si hay varias decenas de puntos
+    if len(valid) >= 10:
+        any_dec = any(
+            (abs(float(r["latitude"])  - round(float(r["latitude"])))  > 1e-6) or
+            (abs(float(r["longitude"]) - round(float(r["longitude"]))) > 1e-6)
+            for r in valid[:50]
+        )
+        if not any_dec:
+            return False, "coord_sin_decimales"
+
     return True, "ok"
+
 
 # ----------------------- Derivados: hora de adquisición -------------------
 
@@ -310,11 +315,15 @@ def _add_acq_time_utc(rows: List[Dict[str, Any]], slot_ts_iso: str) -> List[Dict
 # ------------------------------ Snapshots ---------------------------------
 
 def _build_snapshot(ts: str, h5bytes: bytes, bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
-    """Construye el snapshot 'crudo' (sin umbrales) filtrado por bbox por defecto."""
     parsed = _parse_h5(h5bytes)
     rows_all = parsed["rows"]
+
+    # ✅ Sanidad sobre el conjunto global (detecta parseos malos, no la ausencia regional)
+    ok, reason = _sanity_checks(rows_all)
+
+    # Luego aplicamos el BBOX de Iberia solo para la salida
     rows_bbox = _filter_bbox(rows_all, bbox)
-    ok, reason = _sanity_checks(rows_bbox)
+
     slot_iso = _slot_iso_from_ts(ts)
     rows_bbox = _add_acq_time_utc(rows_bbox, slot_iso)
 
@@ -328,6 +337,7 @@ def _build_snapshot(ts: str, h5bytes: bytes, bbox: Tuple[float, float, float, fl
         "sha256": _sha256(h5bytes),
     }
     return snap
+
 
 # -------------------------- API para FastAPI ------------------------------
 
@@ -420,4 +430,5 @@ async def startup_warmup():
     except Exception:
         # Silencioso: el cron hará /reload en minutos
         pass
+
 
