@@ -1,15 +1,14 @@
 # ingest.py — Microservicio LSA SAF FRP-PIXEL → JSON (doble buffer en RAM)
 # -----------------------------------------------------------------------------
 # Qué hace:
-#  - Descarga ficheros HDF5 del producto FRP-PIXEL (Meteosat, LSA SAF) vía HTTP Basic Auth.
-#  - Parsea el “List Product” de detecciones con vinculación ESTRICTA por nombre de datasets.
-#  - Aplica correctamente scale_factor y add_offset, y enmascara _FillValue.
-#  - Valida sanidad del slot y mantiene un doble buffer en memoria (current/previous).
+#  - Descarga ficheros HDF5 del FRP-PIXEL (Meteosat, LSA SAF) vía HTTP (Basic Auth opcional).
+#  - Parsea el “List Product” vinculando datasets por nombre real (LATITUDE/LONGITUDE/FRP…).
+#  - Aplica SCALING_FACTOR (÷) y MISSING_VALUE (máscara); compatibilidad con scale_factor/_FillValue.
+#  - Valida sanidad del slot y mantiene doble buffer en memoria (current/previous).
 #  - Expone helpers para FastAPI: startup_warmup, reload_latest_async, get_snapshot_for_serve,
 #    ingest_slot_by_ts_async y la constante DEFAULT_IBERIA_BBOX.
 # -----------------------------------------------------------------------------
-# NOTA: Mantiene la misma interfaz pública que el fichero original.
-#       Listo para copiar/pegar sobre ingest.py sin tocar app.py.
+# NOTA: Mantiene la misma interfaz pública que el fichero anterior.
 
 from __future__ import annotations
 
@@ -18,8 +17,7 @@ import datetime as dt
 import hashlib
 import io
 import os
-import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import h5py  # type: ignore
 import numpy as np  # type: ignore
@@ -27,7 +25,7 @@ import requests  # type: ignore
 
 # ----------------------------- Configuración -------------------------------
 
-# BBOX Iberia por defecto (w,s,e,n). Se usa cuando no se especifica bbox en lectura.
+# BBOX Iberia por defecto (w,s,e,n). Se usa cuando no se especifica bbox.
 DEFAULT_IBERIA_BBOX: Tuple[float, float, float, float] = tuple(
     map(float, os.getenv("IBERIA_BBOX", "-9.5,35.5,3.5,44.5").split(","))
 )  # type: ignore
@@ -85,7 +83,7 @@ def _build_url_from_ts(ts: str) -> str:
     return f"{LSA_HOST}{path}"
 
 def _download_hdf5(url: str) -> bytes:
-    """Descarga el HDF5 (bytes) con Basic Auth."""
+    """Descarga el HDF5 (bytes) con Basic Auth opcional."""
     auth = (LSASAF_USER, LSASAF_PASS) if LSASAF_USER or LSASAF_PASS else None
     r = requests.get(url, timeout=HTTP_TIMEOUT, auth=auth)
     r.raise_for_status()
@@ -104,60 +102,69 @@ def _slot_iso_from_ts(ts: str) -> str:
 def _read_scaled(dset: h5py.Dataset) -> np.ma.MaskedArray:
     """
     Lee un dataset HDF5 y aplica:
-    - _FillValue → máscara
-    - scale_factor y add_offset (si existen)
-    Devuelve un masked array 1D/ND (respetando la forma original).
+    - Enmascarado por MISSING_VALUE o _FillValue.
+    - Escalado:
+        * Si existe SCALING_FACTOR ⇒ valor_final = valor_crudo / SCALING_FACTOR
+        * En su defecto, usar scale_factor y add_offset (CF) ⇒ valor*scale_factor + add_offset
+    Devuelve un masked array 1D/ND (se respeta la forma original).
     """
-    data = dset[()]  # ndarray o escalar
-    data = np.array(data)  # asegura ndarray
-    # Máscara por _FillValue
-    fv = dset.attrs.get("_FillValue", None)
-    if fv is not None:
-        data = np.ma.masked_where(data == fv, data)
+    data = np.array(dset[()])  # ndarray
+    missing = dset.attrs.get("MISSING_VALUE", dset.attrs.get("_FillValue", None))
+    if missing is not None:
+        data = np.ma.masked_where(data == missing, data)
     else:
         data = np.ma.masked_invalid(data)
-    # Escalado
-    scale = dset.attrs.get("scale_factor", 1.0)
-    offset = dset.attrs.get("add_offset", 0.0)
-    try:
-        data = data.astype(np.float64) * float(scale) + float(offset)
-    except Exception:
-        # Si no es convertible, dejamos como está
-        data = data.astype(np.float64)
+
+    if "SCALING_FACTOR" in dset.attrs:
+        sf = float(dset.attrs.get("SCALING_FACTOR", 1.0) or 1.0)
+        if sf not in (0.0, 1.0):
+            data = data.astype(np.float64) / sf
+        else:
+            data = data.astype(np.float64)
+    else:
+        scale = float(dset.attrs.get("scale_factor", 1.0) or 1.0)
+        offset = float(dset.attrs.get("add_offset", 0.0) or 0.0)
+        data = data.astype(np.float64) * scale + offset
+
     return data
 
 def _find_datasets_by_name(f: h5py.File) -> Dict[str, h5py.Dataset]:
     """
-    Vinculación ESTRICTA por nombre (case-insensitive) a datasets 1D:
-    Latitud, Longitud, FRP, Confidence, Pixel_area.
+    Vinculación ESTRICTA por nombre (case-insensitive), sin asumir grupos.
+    Se toma el *último componente* de la ruta HDF5 y se iguala a alguno de estos:
+      - LATITUDE / LONGITUDE / FRP  (obligatorios)
+      - FIRE_CONFIDENCE (opcional)
+      - PIXEL_SIZE (área en km², opcional)
+      - ACQTIME (opcional)
+    Se incluyen alias razonables por compatibilidad.
     """
-    candidates = {
-        "lat":  [r"/Latitude$"],
-        "lon":  [r"/Longitude$"],
-        "frp":  [r"/FRP$"],
-        "conf": [r"/Confidence$", r"/Conf$"],
-        "area": [r"/Pixel_area$", r"/PixelArea$", r"/Pixel_Area$"],
-        "time": [r"/Time$", r"/Time_UTC$"],
+    mapping = {
+        "lat":  ["LATITUDE", "Latitude", "lat"],
+        "lon":  ["LONGITUDE", "Longitude", "lon"],
+        "frp":  ["FRP", "FRP_MW", "Fire_Radiative_Power"],
+        "conf": ["FIRE_CONFIDENCE", "CONFIDENCE", "Confidence"],
+        "area": ["PIXEL_SIZE", "Pixel_area", "PixelArea", "Pixel_Area"],
+        "time": ["ACQTIME", "TIME_UTC", "Time"],
     }
     found: Dict[str, h5py.Dataset] = {}
-    paths: List[str] = []
-    f.visit(paths.append)
-    for key, regexes in candidates.items():
-        for p in paths:
-            for rg in regexes:
-                if re.search(rg, p, flags=re.IGNORECASE):
-                    try:
-                        obj = f[p]
-                        if isinstance(obj, h5py.Dataset):
-                            found[key] = obj
-                            raise StopIteration  # pasa al siguiente key
-                    except Exception:
-                        pass
-        # continue implicit
+    names: List[str] = []
+    f.visit(names.append)  # recorre todas las rutas
+    for key, options in mapping.items():
+        for p in names:
+            try:
+                obj = f[p]
+            except Exception:
+                continue
+            if not isinstance(obj, h5py.Dataset):
+                continue
+            final = p.split("/")[-1]
+            if any(final.lower() == opt.lower() for opt in options):
+                found[key] = obj
+                break
     return found
 
 def _coerce_1d(arr: np.ma.MaskedArray) -> np.ma.MaskedArray:
-    """Aplana a 1D si es posible (maticemos: FRP-PIXEL List es 1D)."""
+    """Aplana a 1D si es posible (el List Product es 1D)."""
     if arr.ndim == 1:
         return arr
     return arr.reshape(-1)
@@ -192,7 +199,6 @@ def _build_rows(lat: np.ma.MaskedArray,
 def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
     """
     Parsea el HDF5 FRP-PIXEL List Product aplicando escala/máscara correctamente.
-    *** Sin heurística laxa por defecto *** para evitar falsos mapeos.
     Si faltan datasets clave (lat/lon/frp) → levanta ValueError.
     """
     with h5py.File(io.BytesIO(h5bytes), "r") as f:
@@ -241,7 +247,7 @@ def _sanity_checks(rows: List[Dict[str, Any]]) -> Tuple[bool, str]:
     """
     Sanidad mínima para aceptar un slot:
     - ≥ 1 fila tras parseo.
-    - FRP no constante en todas las filas (evita 'todo 1000.0').
+    - FRP no constante en todas las filas.
     - Coordenadas con decimales en algún % (evita enteros discretizados).
     """
     if not rows:
@@ -251,7 +257,7 @@ def _sanity_checks(rows: List[Dict[str, Any]]) -> Tuple[bool, str]:
         return False, "frp_vacios"
     if len(set(round(x, 3) for x in frps)) == 1:
         return False, "frp_constante"
-    # Chequeo sencillo de decimales en lat/lon
+    # Chequeo rápido de decimales en lat/lon
     any_dec = False
     for r in rows[:50]:
         la, lo = r.get("latitude"), r.get("longitude")
@@ -299,13 +305,13 @@ async def reload_latest_async() -> Dict[str, Any]:
     global _current, _previous
     async with _lock:
         now = dt.datetime.utcnow()
+        last_err = None
         for ts in _candidate_ts_list(now):
             url = _build_url_from_ts(ts)
             try:
                 h5 = _download_hdf5(url)
             except Exception as e:
-                # Prueba el siguiente candidato
-                last_err = str(e)
+                last_err = f"descarga_fallida:{e}"
                 continue
             snap = _build_snapshot(ts, h5, DEFAULT_IBERIA_BBOX)
             if not snap["ok"]:
@@ -321,7 +327,7 @@ async def reload_latest_async() -> Dict[str, Any]:
             _previous, _current = _current, snap
             return {"ok": True, "status": "publicado", "slot_ts": snap["slot_ts"], "count": snap["count"]}
         # Si llegamos aquí, no hubo candidatos válidos
-        return {"ok": False, "status": "sin_candidato_valido", "error": last_err if 'last_err' in locals() else "descargas_fallidas"}
+        return {"ok": False, "status": "sin_candidato_valido", "error": last_err or "descargas_fallidas"}
 
 async def ingest_slot_by_ts_async(
     ts: str,
