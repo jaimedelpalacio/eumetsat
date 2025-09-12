@@ -255,37 +255,152 @@ def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
             )
         return {"rows": rows}
 
-    def _by_flex(f: h5py.File) -> Dict[str, Any]:
+def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
+    """
+    Parsea el HDF5 de FRP-PIXEL y devuelve {'rows': [...] }.
+    Orden de intentos:
+      1) Datasets 1D por NOMBRE (regex) -> lat/lon/frp/etc.
+      2) Datasets COMPUESTOS (dtype.names) -> extrae campos lat/lon/frp/etc.
+      3) Fallback FLEX (heurística sobre 1D numéricos).
+    """
+    def _flatten_1d_to_list(x) -> List[float]:
+        # Aplana dataset 1D a lista de float; otras formas -> []
+        try:
+            if hasattr(x, "shape"):
+                if len(x.shape) != 1 or x.shape[0] == 0:
+                    return []
+                return [float(v) for v in x[:]]
+            if isinstance(x, (list, tuple)):
+                return [float(v) for v in x]
+        except Exception:
+            pass
+        return []
+
+    def _by_regex(f: h5py.File) -> List[Dict[str, Any]]:
+        # Busca por nombres típicos
+        paths: List[str] = []
+        f.visit(paths.append)
+
+        def find_one(regex_list: List[str]):
+            for p in paths:
+                for rg in regex_list:
+                    if re.search(rg, p, re.IGNORECASE):
+                        try:
+                            return f[p]
+                        except Exception:
+                            pass
+            return None
+
+        lat = find_one([r"/lat(i(tude)?)?$", r"/(?:^|/)lat$"])
+        lon = find_one([r"/lon(g(i(tude)?)?)?$", r"/(?:^|/)lon$"])
+        frp = find_one([r"/frp(?!.*grid)"])
+        unc = find_one([r"/frp_?unc(|_mw)?$", r"/uncert"])
+        conf = find_one([r"/conf(idence)?$"])
+        area = find_one([r"/(pixel_)?area"])
+        tim = find_one([r"/time"])
+
+        latL = _flatten_1d_to_list(lat)  if lat  is not None else []
+        lonL = _flatten_1d_to_list(lon)  if lon  is not None else []
+        frpL = _flatten_1d_to_list(frp)  if frp  is not None else []
+        uncL = _flatten_1d_to_list(unc)  if unc  is not None else []
+        conL = _flatten_1d_to_list(conf) if conf is not None else []
+        areL = _flatten_1d_to_list(area) if area is not None else []
+        timL = _flatten_1d_to_list(tim)  if tim  is not None else []
+
+        n = max(len(latL), len(lonL), len(frpL), len(uncL), len(conL), len(areL), len(timL), 0)
+        if n == 0:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        for i in range(n):
+            rows.append({
+                "lat":        float(latL[i])  if i < len(latL) else None,
+                "lon":        float(lonL[i])  if i < len(lonL) else None,
+                "frp_mw":     float(frpL[i])  if i < len(frpL) else None,
+                "frp_unc_mw": float(uncL[i])  if i < len(uncL) else None,
+                "confidence": float(conL[i])  if i < len(conL) else None,
+                "pixel_km2":  float(areL[i])  if i < len(areL) else None,
+                "time_raw":   float(timL[i])  if i < len(timL) else None,
+            })
+        return rows
+
+    def _by_compound(f: h5py.File) -> List[Dict[str, Any]]:
         """
-        Heurístico sin numpy:
-        - Recorre datasets 1D numéricos y los agrupa por longitud.
-        - En el grupo de mayor longitud intenta:
-            * lat: % valores en [-90, 90] (desempate por nombre)
-            * lon: % valores en [-180, 180] (desempate por nombre)
-            * frp: proporción de valores >= 0 y existencia de alguno > 0 (desempate por nombre)
-            * time: secuencia con más “incrementos” (monotonía parcial)
+        Soporte para datasets COMPUESTOS (dtype.names). Busca cualquier dataset 1D con campos.
+        Intenta mapear campos por nombre a: lat/lon/frp/confidence/area/time.
         """
-        # Colección de candidatos 1D
+        rows_all: List[Dict[str, Any]] = []
+
+        def try_one(ds: h5py.Dataset):
+            # Solo 1D y con dtype compuesto
+            if not isinstance(ds, h5py.Dataset) or ds.ndim != 1 or not getattr(ds.dtype, "names", None):
+                return []
+
+            names = [n.lower() for n in ds.dtype.names]  # p. ej. ('LAT','LON','FRP',...)
+            def pick(keys: List[str]) -> Optional[str]:
+                for k in keys:
+                    for n in names:
+                        if k in n:
+                            return n
+                return None
+
+            k_lat = pick(["lat"])            # 'lat', 'latitude'
+            k_lon = pick(["lon", "long"])    # 'lon', 'long', 'longitude'
+            k_frp = pick(["frp"])            # 'frp', 'frp_mw'
+            k_con = pick(["conf"])           # 'conf','confidence'
+            k_are = pick(["area"])           # 'area','pixel'
+            k_tim = pick(["time","tstamp"])  # 'time','timestamp'
+
+            # Si no hay al menos lat/lon o frp, saltamos
+            if not (k_lat or k_lon or k_frp):
+                return []
+
+            out: List[Dict[str, Any]] = []
+            data = ds[:]  # array de registros
+            for rec in data:
+                def getf(k):
+                    if not k: return None
+                    try:
+                        v = rec[k]
+                        # v puede ser numpy scalar -> cast a float si posible
+                        return float(v) if v is not None else None
+                    except Exception:
+                        return None
+
+                out.append({
+                    "lat":        getf(k_lat),
+                    "lon":        getf(k_lon),
+                    "frp_mw":     getf(k_frp),
+                    "frp_unc_mw": None,
+                    "confidence": getf(k_con),
+                    "pixel_km2":  getf(k_are),
+                    "time_raw":   getf(k_tim),
+                })
+            return out
+
+        f.visititems(lambda name, obj: rows_all.extend(try_one(obj)))
+        return rows_all
+
+    def _by_flex(f: h5py.File) -> List[Dict[str, Any]]:
+        """Heurístico sin numpy sobre datasets 1D numéricos (como ya te monté)."""
+        # Candidatos 1D numéricos
         cands: List[Tuple[str, List[float]]] = []
 
         def _is_numeric_dtype(d: Any) -> bool:
             s = str(d)
-            # tipos numéricos habituales en h5py
             return any(k in s for k in ("int", "float", "i1", "i2", "i4", "i8", "f4", "f8"))
 
         def _visitor(name, obj):
             if isinstance(obj, h5py.Dataset) and obj.ndim == 1 and obj.size > 0 and _is_numeric_dtype(obj.dtype):
                 try:
-                    # Limitamos muestra para memoria/velocidad si fuera enorme
-                    m = min(obj.size, 500000)  # hasta 5e5 elementos
+                    m = min(obj.size, 500000)
                     vals = [float(v) for v in obj[:m]]
                     cands.append((name, vals))
                 except Exception:
                     pass
-
         f.visititems(_visitor)
         if not cands:
-            return {"rows": []}
+            return []
 
         # Agrupa por longitud (preferimos la mayor)
         groups: Dict[int, List[Tuple[str, List[float]]]] = {}
@@ -295,106 +410,91 @@ def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
         group = groups[length]
 
         def frac_in_range(a: List[float], lo: float, hi: float) -> float:
-            total = 0
-            ok = 0
-            for v in a:
-                if v == v:  # no NaN
-                    total += 1
-                    if lo <= v <= hi:
-                        ok += 1
-            return (ok / total) if total else 0.0
-
-        def some_positive(a: List[float]) -> bool:
-            for v in a:
-                if v == v and v > 0:
-                    return True
-            return False
-
-        def nonneg_fraction(a: List[float]) -> float:
-            total = 0
-            ok = 0
+            tot = ok = 0
             for v in a:
                 if v == v:
-                    total += 1
-                    if v >= 0:
-                        ok += 1
-            return (ok / total) if total else 0.0
+                    tot += 1
+                    if lo <= v <= hi: ok += 1
+            return (ok / tot) if tot else 0.0
+
+        def some_positive(a: List[float]) -> bool:
+            return any((v == v and v > 0) for v in a)
+
+        def nonneg_fraction(a: List[float]) -> float:
+            tot = ok = 0
+            for v in a:
+                if v == v:
+                    tot += 1
+                    if v >= 0: ok += 1
+            return (ok / tot) if tot else 0.0
 
         def name_score(n: str, keys: List[str]) -> float:
-            nlow = n.lower()
-            return 1.0 if any(k in nlow for k in keys) else 0.0
+            nlow = n.lower();  return 1.0 if any(k in nlow for k in keys) else 0.0
 
-        # Selección de lat/lon
-        best_lat = (-1.0, -1)
-        best_lon = (-1.0, -1)
+        # Selección lat/lon
+        best_lat = (-1.0, -1); best_lon = (-1.0, -1)
         for i, (n, a) in enumerate(group):
             sc = frac_in_range(a, -90, 90) + 0.1 * name_score(n, ["lat"])
-            if sc > best_lat[0]:
-                best_lat = (sc, i)
+            if sc > best_lat[0]: best_lat = (sc, i)
         for i, (n, a) in enumerate(group):
             sc = frac_in_range(a, -180, 180) + 0.1 * name_score(n, ["lon"])
-            if sc > best_lon[0]:
-                best_lon = (sc, i)
+            if sc > best_lon[0]: best_lon = (sc, i)
 
         lat_arr = group[best_lat[1]][1] if best_lat[1] >= 0 else None
         lon_arr = group[best_lon[1]][1] if best_lon[1] >= 0 else None
 
-        # Selección de FRP
+        # FRP
         best_frp = (-1.0, -1)
         for i, (n, a) in enumerate(group):
             if some_positive(a):
                 sc = nonneg_fraction(a) + 0.05 * name_score(n, ["frp"])
-                if sc > best_frp[0]:
-                    best_frp = (sc, i)
+                if sc > best_frp[0]: best_frp = (sc, i)
         frp_arr = group[best_frp[1]][1] if best_frp[1] >= 0 else None
 
-        # Selección de time (monotonía parcial)
+        # time (monotonía parcial)
         def inc_score(a: List[float], k: int = 2048) -> float:
-            # cuenta incrementos sobre una ventana
             k = min(k, len(a) - 1) if len(a) > 1 else 0
-            if k <= 0:
-                return 0.0
-            inc = 0
-            prev = a[0]
+            if k <= 0: return 0.0
+            inc = 0; prev = a[0]
             for i in range(1, k + 1):
                 cur = a[i]
-                if cur == cur and prev == prev and cur >= prev:
-                    inc += 1
+                if cur == cur and prev == prev and cur >= prev: inc += 1
                 prev = cur
             return float(inc)
 
         best_t = (-1.0, -1)
         for i, (n, a) in enumerate(group):
             sc = inc_score(a) + 0.05 * name_score(n, ["time", "tstamp", "date"])
-            if sc > best_t[0]:
-                best_t = (sc, i)
+            if sc > best_t[0]: best_t = (sc, i)
         time_arr = group[best_t[1]][1] if best_t[1] >= 0 else None
 
-        # Si no hay nada identificable, devolvemos vacío
         if lat_arr is None and lon_arr is None and frp_arr is None:
-            return {"rows": []}
+            return []
 
         rows: List[Dict[str, Any]] = []
         for i in range(length):
-            rows.append(
-                {
-                    "lat": float(lat_arr[i]) if lat_arr is not None else None,
-                    "lon": float(lon_arr[i]) if lon_arr is not None else None,
-                    "frp_mw": float(frp_arr[i]) if frp_arr is not None else None,
-                    "frp_unc_mw": None,
-                    "confidence": None,
-                    "pixel_km2": None,
-                    "time_raw": float(time_arr[i]) if time_arr is not None and i < len(time_arr) else None,
-                }
-            )
+            rows.append({
+                "lat":        float(lat_arr[i]) if lat_arr is not None else None,
+                "lon":        float(lon_arr[i]) if lon_arr is not None else None,
+                "frp_mw":     float(frp_arr[i]) if frp_arr is not None else None,
+                "frp_unc_mw": None,
+                "confidence": None,
+                "pixel_km2":  None,
+                "time_raw":   float(time_arr[i]) if (time_arr is not None and i < len(time_arr)) else None,
+            })
+        return rows
+
+    # --- ejecución ---
+    with h5py.File(io.BytesIO(h5bytes), "r") as f:
+        rows = _by_regex(f)
+        if rows:
+            return {"rows": rows}
+        rows = _by_compound(f)
+        if rows:
+            return {"rows": rows}
+        rows = _by_flex(f)
         return {"rows": rows}
 
-    with h5py.File(io.BytesIO(h5bytes), "r") as f:
-        byname = _by_regex(f)
-        if byname["rows"]:
-            return byname
-        # Fallback: flex
-        return _by_flex(f)
 
 
 def _h5_datasets_summary(h5bytes: bytes, sample: int = 3) -> List[Dict[str, Any]]:
@@ -574,3 +674,4 @@ async def startup_warmup():
     except Exception:
         # Silencioso: el cron del panel reintenta en minutos
         pass
+
