@@ -4,11 +4,12 @@
 #  - Descarga ficheros HDF5 del FRP-PIXEL (Meteosat, LSA SAF) vía HTTP (Basic Auth opcional).
 #  - Parsea el “List Product” vinculando datasets por nombre real (LATITUDE/LONGITUDE/FRP…).
 #  - Aplica SCALING_FACTOR (÷) y MISSING_VALUE (máscara); compatibilidad con scale_factor/_FillValue.
+#  - Añade acq_time_utc (ISO) a partir de time_raw (HHMM) usando la fecha del slot.
 #  - Valida sanidad del slot y mantiene doble buffer en memoria (current/previous).
 #  - Expone helpers para FastAPI: startup_warmup, reload_latest_async, get_snapshot_for_serve,
 #    ingest_slot_by_ts_async y la constante DEFAULT_IBERIA_BBOX.
 # -----------------------------------------------------------------------------
-# NOTA: Mantiene la misma interfaz pública que el fichero anterior.
+# NOTA: Mantiene la misma interfaz pública esperada por app.py.
 
 from __future__ import annotations
 
@@ -73,7 +74,7 @@ def _candidate_ts_list(now_utc: Optional[dt.datetime] = None) -> List[str]:
     """Lista de candidatos: [t, t-15, t-30, ...] en formato YYYYMMDDHHMM."""
     start = _ts_for_latest(now_utc)
     base_dt = dt.datetime.strptime(start, "%Y%m%d%H%M")
-    return [(base_dt - dt.timedelta(minutes=15*i)).strftime("%Y%m%d%H%M") for i in range(FALLBACKS + 1)]
+    return [(base_dt - dt.timedelta(minutes=15 * i)).strftime("%Y%m%d%H%M") for i in range(FALLBACKS + 1)]
 
 def _build_url_from_ts(ts: str) -> str:
     """Construye la URL de descarga a partir del timestamp."""
@@ -109,12 +110,14 @@ def _read_scaled(dset: h5py.Dataset) -> np.ma.MaskedArray:
     Devuelve un masked array 1D/ND (se respeta la forma original).
     """
     data = np.array(dset[()])  # ndarray
+    # Máscara por MISSING_VALUE o _FillValue
     missing = dset.attrs.get("MISSING_VALUE", dset.attrs.get("_FillValue", None))
     if missing is not None:
         data = np.ma.masked_where(data == missing, data)
     else:
         data = np.ma.masked_invalid(data)
 
+    # Escalado
     if "SCALING_FACTOR" in dset.attrs:
         sf = float(dset.attrs.get("SCALING_FACTOR", 1.0) or 1.0)
         if sf not in (0.0, 1.0):
@@ -143,7 +146,7 @@ def _find_datasets_by_name(f: h5py.File) -> Dict[str, h5py.Dataset]:
         "lon":  ["LONGITUDE", "Longitude", "lon"],
         "frp":  ["FRP", "FRP_MW", "Fire_Radiative_Power"],
         "conf": ["FIRE_CONFIDENCE", "CONFIDENCE", "Confidence"],
-        "area": ["PIXEL_SIZE", "Pixel_area", "PixelArea", "Pixel_Area"],
+        "area": ["PIXEL_SIZE", "Pixel_size", "Pixel_area", "PixelArea", "Pixel_Area"],
         "time": ["ACQTIME", "TIME_UTC", "Time"],
     }
     found: Dict[str, h5py.Dataset] = {}
@@ -169,31 +172,41 @@ def _coerce_1d(arr: np.ma.MaskedArray) -> np.ma.MaskedArray:
         return arr
     return arr.reshape(-1)
 
-def _build_rows(lat: np.ma.MaskedArray,
-                lon: np.ma.MaskedArray,
-                frp: np.ma.MaskedArray,
-                conf: Optional[np.ma.MaskedArray],
-                area: Optional[np.ma.MaskedArray],
-                tim: Optional[np.ma.MaskedArray]) -> List[Dict[str, Any]]:
+def _build_rows(
+    lat: np.ma.MaskedArray,
+    lon: np.ma.MaskedArray,
+    frp: np.ma.MaskedArray,
+    conf: Optional[np.ma.MaskedArray],
+    area: Optional[np.ma.MaskedArray],
+    tim: Optional[np.ma.MaskedArray],
+) -> List[Dict[str, Any]]:
     """
     Une campos por índice y genera la lista de detecciones.
     Los valores enmascarados → None.
     """
-    lat = _coerce_1d(lat); lon = _coerce_1d(lon); frp = _coerce_1d(frp)
+    lat = _coerce_1d(lat)
+    lon = _coerce_1d(lon)
+    frp = _coerce_1d(frp)
     n = min(lat.shape[0], lon.shape[0], frp.shape[0])
-    if conf is not None: conf = _coerce_1d(conf)
-    if area is not None: area = _coerce_1d(area)
-    if tim  is not None: tim  = _coerce_1d(tim)
+    if conf is not None:
+        conf = _coerce_1d(conf)
+    if area is not None:
+        area = _coerce_1d(area)
+    if tim is not None:
+        tim = _coerce_1d(tim)
+
     rows: List[Dict[str, Any]] = []
     for i in range(n):
-        rows.append({
-            "latitude":  (None if np.ma.is_masked(lat[i]) else float(lat[i])),
-            "longitude": (None if np.ma.is_masked(lon[i]) else float(lon[i])),
-            "frp_mw":    (None if np.ma.is_masked(frp[i]) else float(frp[i])),
-            "confidence": (None if conf is None or np.ma.is_masked(conf[i]) else float(conf[i])),
-            "pixel_km2": (None if area is None or np.ma.is_masked(area[i]) else float(area[i])),
-            "time_raw":  (None if tim  is None or np.ma.is_masked(tim[i])  else float(tim[i])),
-        })
+        rows.append(
+            {
+                "latitude": (None if np.ma.is_masked(lat[i]) else float(lat[i])),
+                "longitude": (None if np.ma.is_masked(lon[i]) else float(lon[i])),
+                "frp_mw": (None if np.ma.is_masked(frp[i]) else float(frp[i])),
+                "confidence": (None if conf is None or np.ma.is_masked(conf[i]) else float(conf[i])),
+                "pixel_km2": (None if area is None or np.ma.is_masked(area[i]) else float(area[i])),
+                "time_raw": (None if tim is None or np.ma.is_masked(tim[i]) else float(tim[i])),
+            }
+        )
     return rows
 
 def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
@@ -211,7 +224,7 @@ def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
         frp = _read_scaled(found["frp"])
         conf = _read_scaled(found["conf"]) if "conf" in found else None
         area = _read_scaled(found["area"]) if "area" in found else None
-        tim  = _read_scaled(found["time"]) if "time" in found else None
+        tim = _read_scaled(found["time"]) if "time" in found else None
         rows = _build_rows(lat, lon, frp, conf, area, tim)
     return {"rows": rows}
 
@@ -222,7 +235,8 @@ def _filter_bbox(rows: List[Dict[str, Any]], bbox: Tuple[float, float, float, fl
     w, s, e, n = bbox
     out = []
     for r in rows:
-        la = r.get("latitude"); lo = r.get("longitude")
+        la = r.get("latitude")
+        lo = r.get("longitude")
         if la is None or lo is None:
             continue
         if (w <= lo <= e) and (s <= la <= n):
@@ -233,7 +247,8 @@ def _apply_thresholds(rows: List[Dict[str, Any]], min_frp: Optional[float], min_
     """Aplica filtros por mínimos (si se dan)."""
     out = []
     for r in rows:
-        frp = r.get("frp_mw"); conf = r.get("confidence")
+        frp = r.get("frp_mw")
+        conf = r.get("confidence")
         if min_frp is not None and (frp is None or frp < min_frp):
             continue
         if min_conf is not None and (conf is None or conf < min_conf):
@@ -269,6 +284,29 @@ def _sanity_checks(rows: List[Dict[str, Any]]) -> Tuple[bool, str]:
         return False, "coord_sin_decimales"
     return True, "ok"
 
+# ----------------------- Derivados: hora de adquisición -------------------
+
+def _add_acq_time_utc(rows: List[Dict[str, Any]], slot_ts_iso: str) -> List[Dict[str, Any]]:
+    """
+    Convierte time_raw (HHMM) en acq_time_utc (ISO Z) usando la fecha del slot.
+    No elimina time_raw; sólo añade acq_time_utc si es consistente.
+    """
+    base = dt.datetime.strptime(slot_ts_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        rr = dict(r)
+        tr = rr.get("time_raw")
+        if tr is not None:
+            try:
+                v = int(tr)
+                hh, mm = v // 100, v % 100
+                if 0 <= hh <= 23 and 0 <= mm <= 59:
+                    rr["acq_time_utc"] = base.replace(hour=hh, minute=mm).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                pass  # si no cuadra, no añadimos el campo
+        out.append(rr)
+    return out
+
 # ------------------------------ Snapshots ---------------------------------
 
 def _build_snapshot(ts: str, h5bytes: bytes, bbox: Tuple[float, float, float, float]) -> Dict[str, Any]:
@@ -277,10 +315,13 @@ def _build_snapshot(ts: str, h5bytes: bytes, bbox: Tuple[float, float, float, fl
     rows_all = parsed["rows"]
     rows_bbox = _filter_bbox(rows_all, bbox)
     ok, reason = _sanity_checks(rows_bbox)
+    slot_iso = _slot_iso_from_ts(ts)
+    rows_bbox = _add_acq_time_utc(rows_bbox, slot_iso)
+
     snap = {
         "ok": ok,
         "reason": (None if ok else reason),
-        "slot_ts": _slot_iso_from_ts(ts),
+        "slot_ts": slot_iso,
         "downloaded_at": dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "rows": rows_bbox,
         "count": len(rows_bbox),
@@ -305,7 +346,7 @@ async def reload_latest_async() -> Dict[str, Any]:
     global _current, _previous
     async with _lock:
         now = dt.datetime.utcnow()
-        last_err = None
+        last_err: Optional[str] = None
         for ts in _candidate_ts_list(now):
             url = _build_url_from_ts(ts)
             try:
@@ -319,10 +360,20 @@ async def reload_latest_async() -> Dict[str, Any]:
                 continue
             # Monotonía: no retroceder
             if _current and snap["slot_ts"] <= _current["slot_ts"]:
-                return {"ok": True, "status": "noop_monotonia", "slot_ts": _current["slot_ts"], "count": _current["count"]}
+                return {
+                    "ok": True,
+                    "status": "noop_monotonia",
+                    "slot_ts": _current["slot_ts"],
+                    "count": _current["count"],
+                }
             # Idempotencia
             if _current and snap["sha256"] == _current.get("sha256"):
-                return {"ok": True, "status": "noop_idempotente", "slot_ts": _current["slot_ts"], "count": _current["count"]}
+                return {
+                    "ok": True,
+                    "status": "noop_idempotente",
+                    "slot_ts": _current["slot_ts"],
+                    "count": _current["count"],
+                }
             # Conmutación atómica
             _previous, _current = _current, snap
             return {"ok": True, "status": "publicado", "slot_ts": snap["slot_ts"], "count": snap["count"]}
@@ -350,9 +401,11 @@ async def ingest_slot_by_ts_async(
         return {"ok": False, "status": "parse_fallido", "error": str(e)}
     rows = _filter_bbox(parsed["rows"], bbox)
     rows = _apply_thresholds(rows, min_frp=min_frp, min_conf=min_conf)
+    slot_iso = _slot_iso_from_ts(ts)
+    rows = _add_acq_time_utc(rows, slot_iso)
     resp = {
         "ok": True,
-        "slot_ts": _slot_iso_from_ts(ts),
+        "slot_ts": slot_iso,
         "downloaded_at": dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "count": len(rows),
         "bbox": {"w": bbox[0], "s": bbox[1], "e": bbox[2], "n": bbox[3]},
