@@ -71,14 +71,22 @@ def _ts_for_latest(now_utc: Optional[dt.datetime] = None, lag_min: int = LAG_MIN
 
 def _candidate_ts_list(now_utc: Optional[dt.datetime] = None) -> List[str]:
     """
-    Genera lista de TS a probar: t, t-15, t-30, ... según FALLBACKS.
+    Genera la lista de timestamps candidatos, de más reciente a más antiguo:
+    - Primero el slot actual (UTC redondeado al cuarto de hora).
+    - Luego retrocede en pasos de 15 min hasta 'FALLBACKS'.
+    Devuelve 'out' para ser drop-in con tu versión anterior.
     """
-    t0 = dt.datetime.strptime(_ts_for_latest(now_utc), "%Y%m%d%H%M")
-    out = [t0.strftime("%Y%m%d%H%M")]
-    for i in range(1, FALLBACKS + 1):
-        ti = t0 - dt.timedelta(minutes=15 * i)
+    if now_utc is None:
+        now_utc = dt.datetime.utcnow()
+
+    base = _floor_to_quarter(now_utc)  # p.ej., 15:30, 15:45, etc. (UTC)
+    out: List[str] = []
+    for i in range(0, FALLBACKS + 1):
+        ti = base - dt.timedelta(minutes=15 * i)
         out.append(ti.strftime("%Y%m%d%H%M"))
+
     return out
+
 
 
 def _build_url_from_ts(ts: str) -> str:
@@ -360,4 +368,5 @@ async def startup_warmup():
     except Exception:
         # Silencioso: el cron del panel reintenta en minutos
         pass
+
 
