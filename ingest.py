@@ -261,6 +261,8 @@ async def reload_latest_async() -> Dict[str, Any]:
       - Idempotencia: si sha256 coincide, no conmuta.
       - Sanidad: no aceptar vacíos si antes teníamos datos (opcional).
     """
+    global _current, _previous  # <-- DECLARAR GLOBAL ANTES DE USARLAS
+
     async with _lock:
         now = dt.datetime.utcnow()
         tried: List[str] = []
@@ -289,7 +291,6 @@ async def reload_latest_async() -> Dict[str, Any]:
                     continue
 
                 # Conmutación atómica
-                global _current, _previous
                 _previous = _current
                 _current = new_snap
 
@@ -304,6 +305,7 @@ async def reload_latest_async() -> Dict[str, Any]:
 
         # Si llegamos aquí, no hubo suerte con ninguno de los fallbacks
         return {"ok": False, "reason": last_err or "unknown", "tried": tried}
+
 
 
 async def ingest_slot_by_ts_async(
@@ -358,3 +360,4 @@ async def startup_warmup():
     except Exception:
         # Silencioso: el cron del panel reintenta en minutos
         pass
+
