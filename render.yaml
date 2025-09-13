@@ -43,6 +43,7 @@ services:
         print(r.read().decode("utf-8"))
     PY
   envVars:
-    - key: b15209343b99a7b0d28f0f0d2a697c0f
+    - key: API_KEY
       sync: false
+
 
