@@ -148,6 +148,11 @@ def _find_datasets_by_name(f: h5py.File) -> Dict[str, h5py.Dataset]:
         "conf": ["FIRE_CONFIDENCE", "CONFIDENCE", "Confidence"],
         "area": ["PIXEL_SIZE", "Pixel_size", "Pixel_area", "PixelArea", "Pixel_Area"],
         "time": ["ACQTIME", "TIME_UTC", "Time"],
+        # ↓↓↓ nuevos (si no existen en el archivo, se ignorarán sin romper nada)
+        "unc":     ["FRP_UNCERTAINTY", "FRP_Uncertainty", "Uncertainty_of_FRP", "FRP_unc", "FRPunc"],
+        "vza":     ["PIXEL_VZA", "Pixel_VZA", "VZA", "View_Zenith_Angle"],
+        "bt_mir":  ["BT_MIR", "BrightnessTemp_MIR", "BT_3.9um", "BT_39"],
+        "bt_tir":  ["BT_TIR", "BrightnessTemp_TIR", "BT_10.8um", "BT_108"],
     }
     found: Dict[str, h5py.Dataset] = {}
     names: List[str] = []
@@ -178,33 +183,54 @@ def _build_rows(
     frp: np.ma.MaskedArray,
     conf: Optional[np.ma.MaskedArray],
     area: Optional[np.ma.MaskedArray],
-    tim: Optional[np.ma.MaskedArray],
+    tim:  Optional[np.ma.MaskedArray],
+    unc:  Optional[np.ma.MaskedArray],
+    vza:  Optional[np.ma.MaskedArray],
+    bt_mir: Optional[np.ma.MaskedArray],
+    bt_tir: Optional[np.ma.MaskedArray],
 ) -> List[Dict[str, Any]]:
     """
-    Une campos por índice y genera la lista de detecciones.
-    Los valores enmascarados → None.
+    Une campos por índice y genera la lista de detecciones. Los valores enmascarados → None.
+    Indexado seguro: si algún opcional es más corto que lat/lon/frp, se rellena con None.
     """
-    lat = _coerce_1d(lat)
-    lon = _coerce_1d(lon)
-    frp = _coerce_1d(frp)
-    n = min(lat.shape[0], lon.shape[0], frp.shape[0])
-    if conf is not None:
-        conf = _coerce_1d(conf)
-    if area is not None:
-        area = _coerce_1d(area)
-    if tim is not None:
-        tim = _coerce_1d(tim)
+    def _coerce(a: Optional[np.ma.MaskedArray]) -> Optional[np.ma.MaskedArray]:
+        if a is None: return None
+        return a if a.ndim == 1 else a.reshape(-1)
+
+    lat   = _coerce(lat)   # obligatorios
+    lon   = _coerce(lon)
+    frp   = _coerce(frp)
+    conf  = _coerce(conf)  # opcionales
+    area  = _coerce(area)
+    tim   = _coerce(tim)
+    unc   = _coerce(unc)
+    vza   = _coerce(vza)
+    bt_mir= _coerce(bt_mir)
+    bt_tir= _coerce(bt_tir)
+
+    # longitud base = min de los obligatorios
+    n = min(lat.shape[0], lon.shape[0], frp.shape[0])  # type: ignore
+
+    def val(arr: Optional[np.ma.MaskedArray], i: int) -> Optional[float]:
+        if arr is None: return None
+        if i >= arr.shape[0]: return None
+        x = arr[i]
+        return None if np.ma.is_masked(x) else float(x)
 
     rows: List[Dict[str, Any]] = []
     for i in range(n):
         rows.append(
             {
-                "latitude": (None if np.ma.is_masked(lat[i]) else float(lat[i])),
-                "longitude": (None if np.ma.is_masked(lon[i]) else float(lon[i])),
-                "frp_mw": (None if np.ma.is_masked(frp[i]) else float(frp[i])),
-                "confidence": (None if conf is None or np.ma.is_masked(conf[i]) else float(conf[i])),
-                "pixel_km2": (None if area is None or np.ma.is_masked(area[i]) else float(area[i])),
-                "time_raw": (None if tim is None or np.ma.is_masked(tim[i]) else float(tim[i])),
+                "latitude":   val(lat, i),
+                "longitude":  val(lon, i),
+                "frp_mw":     val(frp, i),
+                "confidence": val(conf, i),
+                "pixel_km2":  val(area, i),
+                "time_raw":   val(tim, i),
+                "frp_unc_mw": val(unc, i),
+                "vza_deg":    val(vza, i),
+                "bt_mir_k":   val(bt_mir, i),
+                "bt_tir_k":   val(bt_tir, i),
             }
         )
     return rows
@@ -225,7 +251,11 @@ def _parse_h5(h5bytes: bytes) -> Dict[str, Any]:
         conf = _read_scaled(found["conf"]) if "conf" in found else None
         area = _read_scaled(found["area"]) if "area" in found else None
         tim = _read_scaled(found["time"]) if "time" in found else None
-        rows = _build_rows(lat, lon, frp, conf, area, tim)
+        unc     = _read_scaled(found["unc"])     if "unc"     in found else None
+        vza     = _read_scaled(found["vza"])     if "vza"     in found else None
+        bt_mir  = _read_scaled(found["bt_mir"])  if "bt_mir"  in found else None
+        bt_tir  = _read_scaled(found["bt_tir"])  if "bt_tir"  in found else None
+        rows = _build_rows(lat, lon, frp, conf, area, tim, unc, vza, bt_mir, bt_tir)
     return {"rows": rows}
 
 # --------------------------- Filtros en lectura ---------------------------
@@ -443,6 +473,7 @@ async def startup_warmup():
     except Exception:
         # Silencioso: el cron hará /reload en minutos
         pass
+
 
 
 
