@@ -28,3 +28,21 @@ services:
       - key: HTTP_TIMEOUT
         value: "60"
 
+# render.yaml (job de cron)
+- type: cron
+  name: reload-frp
+  schedule: "2-59/5 * * * *"     # cada 5 min, desfasado
+  command: |
+    python - <<'PY'
+    import os, urllib.request, sys
+    KEY = os.environ.get("API_KEY", "")
+    if not KEY:
+      print("Falta API_KEY en env", file=sys.stderr); sys.exit(2)
+    url = f"https://eumetsat-dyfr.onrender.com/reload?key={KEY}"
+    with urllib.request.urlopen(url, timeout=30) as r:
+        print(r.read().decode("utf-8"))
+    PY
+  envVars:
+    - key: b15209343b99a7b0d28f0f0d2a697c0f
+      sync: false
+
