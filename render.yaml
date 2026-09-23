@@ -1,49 +1,33 @@
-# render.yaml (opcional) — Solo define el Web Service que usa tu Dockerfile.
-# El CRON lo sigues creando desde el panel.
+# render.yaml — REFERENCIA de la configuración real. No hay Blueprint enlazado:
+# el servicio y el cron se gestionan desde el panel de Render.
 
 services:
   - type: web
-    name: lsa-saf-frp-bridge
-    env: docker                 # usa el Dockerfile del repo
+    name: eumetsat
+    runtime: docker
     dockerfilePath: ./Dockerfile
-    plan: pro                   # ya que tu servicio está en PRO
+    region: frankfurt
+    plan: starter
+    numInstances: 1            # el estado vive en RAM: una sola instancia
     autoDeploy: true
     healthCheckPath: /health
     envVars:
-      # Secrets (defínelos en el panel → Secrets; aquí solo referencias)
       - key: LSASAF_USER
-        fromSecret: LSASAF_USER
+        sync: false
       - key: LSASAF_PASS
-        fromSecret: LSASAF_PASS
+        sync: false
       - key: API_KEY
-        fromSecret: BRIDGE_API_KEY
+        sync: false
 
-      # Config por defecto (puedes sobreescribirlas en el panel)
-      - key: LAG_MIN
-        value: "30"
-      - key: FALLBACKS
-        value: "8"
-      - key: IBERIA_BBOX
-        value: "-9.5,35.5,3.5,44.5"
-      - key: HTTP_TIMEOUT
-        value: "60"
-
-# render.yaml (job de cron)
-- type: cron
-  name: reload-frp
-  schedule: "2-59/5 * * * *"     # cada 5 min, desfasado
-  command: |
-    python - <<'PY'
-    import os, urllib.request, sys
-    KEY = os.environ.get("API_KEY", "")
-    if not KEY:
-      print("Falta API_KEY en env", file=sys.stderr); sys.exit(2)
-    url = f"https://eumetsat-dyfr.onrender.com/reload?key={KEY}"
-    with urllib.request.urlopen(url, timeout=30) as r:
-        print(r.read().decode("utf-8"))
-    PY
-  envVars:
-    - key: API_KEY
-      sync: false
-
-
+  - type: cron
+    name: eumesatcron
+    runtime: image
+    image:
+      url: docker.io/curlimages/curl:8.8.0
+    region: frankfurt
+    plan: starter
+    schedule: "2-59/5 * * * *"
+    dockerCommand: curl -fsS --max-time 300 -H X-API-Key:${API_KEY} https://eumetsat-dyfr.onrender.com/reload
+    envVars:
+      - key: API_KEY
+        sync: false

@@ -2,10 +2,12 @@
 # -----------------------------------------------------------------------------
 # Qué hace este servicio:
 #  - Mantiene en RAM un doble buffer (current/previous) con el último slot válido.
-#  - /reload (con API key opcional) descarga el último slot disponible y conmuta el buffer.
-#  - /frp-pixel/latest sirve SIEMPRE desde RAM (permite refiltrar por BBOX y umbrales).
+#  - /reload (con API key opcional, cabecera X-API-Key) descarga el último slot disponible y
+#    conmuta el buffer. Responde 503 solo si no hay dato o el servido está desfasado.
+#  - /frp-pixel/latest sirve SIEMPRE desde RAM (permite refiltrar por BBOX y umbrales) e
+#    informa de la antigüedad del dato (age_min / stale).
 #  - /frp-pixel/by-ts descarga/parcea un slot concreto bajo demanda (NO toca el buffer).
-#  - /health informa del estado (warm/cold) y el último slot publicado.
+#  - /health informa del estado (warm/cold), el último slot, su antigüedad y la última recarga.
 #
 # NOTA IMPORTANTE
 #  - El snapshot en RAM ya está recortado por el BBOX por defecto (Iberia).
@@ -17,11 +19,12 @@
 from __future__ import annotations
 
 import os
+import hmac
 import asyncio
 import datetime as dt
 from typing import Optional, Tuple, List, Dict
 
-from fastapi import FastAPI, Query, HTTPException, Response
+from fastapi import FastAPI, Header, Query, HTTPException, Response
 from fastapi.responses import ORJSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
@@ -32,13 +35,19 @@ from ingest import (
     reload_latest_async,
     get_snapshot_for_serve,
     ingest_slot_by_ts_async,
+    snapshot_age_min,
+    is_stale,
+    get_last_reload,
     DEFAULT_IBERIA_BBOX,
+    STALE_MIN,
 )
 
 # ----------------------------- Configuración -------------------------------
 
 APP_TITLE = "LSA SAF FRP-PIXEL (Meteosat) → JSON (RAM double-buffer)"
-API_KEY = os.getenv("API_KEY", "")  # opcional; si se define, protege /reload con ?key=
+# Opcional; si se define, protege /reload. Se envía en la cabecera X-API-Key
+# (?key= se sigue aceptando por compatibilidad, pero deja la clave en los logs).
+API_KEY = os.getenv("API_KEY", "")
 
 # (Sólo para construir URL informativa en respuestas; no se usa para descargar aquí)
 LSA_HOST = os.getenv("LSA_HOST", "https://datalsasaf.lsasvcs.ipma.pt")
@@ -134,7 +143,7 @@ async def root():
     return (
         f"{APP_TITLE}\n"
         f"- /health\n"
-        f"- /reload?key=... (opcional)\n"
+        f"- /reload (cabecera X-API-Key)\n"
         f"- /frp-pixel/latest?bbox=w,s,e,n&min_frp=&min_conf=\n"
         f"- /frp-pixel/by-ts?ts=YYYYMMDDHHMM&bbox=w,s,e,n&min_frp=&min_conf=\n"
     )
@@ -149,26 +158,36 @@ async def health():
     """
     - cold: no hay snapshot aún.
     - warm: hay snapshot en memoria (current o, si no, previous).
+    Siempre 200 (el proceso está vivo); la frescura del dato va en stale/age_min.
     """
     snap = get_snapshot_for_serve()
     if not snap:
-        return {"ok": True, "status": "cold"}
+        return {"ok": True, "status": "cold", "stale": True, "last_reload": get_last_reload()}
+    age = snapshot_age_min(snap)
     return {
         "ok": True,
         "status": "warm",
         "last_slot": snap.get("slot_ts"),
         "downloaded_at": snap.get("downloaded_at"),
         "count": snap.get("count", 0),
+        "age_min": age,
+        "stale": is_stale(age),
+        "stale_after_min": STALE_MIN,
+        "last_reload": get_last_reload(),
     }
 
 @app.get("/reload")
-async def reload(key: Optional[str] = Query(default=None, description="API key si está activada")):
+async def reload(
+    x_api_key: Optional[str] = Header(default=None),
+    key: Optional[str] = Query(default=None, description="(obsoleto) API key por query; usar X-API-Key"),
+):
     """
     Descarga el último slot disponible (con fallbacks) y publica el snapshot
-    si pasa validaciones. Protegible con API_KEY (env) + ?key=...
+    si pasa validaciones. Protegible con API_KEY (env) + cabecera X-API-Key.
     """
     if API_KEY:
-        if key is None or key != API_KEY:
+        provided = x_api_key or key or ""
+        if not hmac.compare_digest(provided.encode(), API_KEY.encode()):
             raise HTTPException(status_code=401, detail="API key inválida")
     result = await reload_latest_async()
     code = 200 if result.get("ok") else 503
@@ -210,10 +229,14 @@ async def frp_latest(
     response.headers["Cache-Control"] = "no-cache"
 
     # Respuesta
+    age = snapshot_age_min(snap)
     payload = {
         "ok": True,
         "slot_ts": snap.get("slot_ts"),
         "downloaded_at": snap.get("downloaded_at"),
+        "age_min": age,                # minutos desde el inicio del slot servido
+        "stale": is_stale(age),        # True si age_min > stale_after_min (dato desfasado)
+        "stale_after_min": STALE_MIN,
         "bbox_used": {"w": DEFAULT_IBERIA_BBOX[0], "s": DEFAULT_IBERIA_BBOX[1],
                       "e": DEFAULT_IBERIA_BBOX[2], "n": DEFAULT_IBERIA_BBOX[3]},
         "count": len(rows),
