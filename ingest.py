@@ -7,9 +7,10 @@
 #  - Añade acq_time_utc (ISO) a partir de time_raw (HHMM) usando la fecha del slot.
 #  - Valida sanidad del slot y mantiene doble buffer en memoria (current/previous).
 #  - Expone helpers para FastAPI: startup_warmup, reload_latest_async, get_snapshot_for_serve,
-#    ingest_slot_by_ts_async y la constante DEFAULT_IBERIA_BBOX.
+#    ingest_slot_by_ts_async, snapshot_age_min, get_last_reload y DEFAULT_IBERIA_BBOX.
 # -----------------------------------------------------------------------------
-# NOTA: Mantiene la misma interfaz pública esperada por app.py.
+# Las descargas y el parseo (bloqueantes) se ejecutan en un hilo aparte para no
+# congelar el servidor: mientras se descarga, /frp-pixel/latest sigue respondiendo.
 
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import datetime as dt
 import hashlib
 import io
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import h5py  # type: ignore
@@ -44,19 +46,37 @@ FRP_VARIANT = os.getenv("FRP_VARIANT", "ListProduct")
 # Minutos de margen para que el último slot esté publicado (evita race).
 LAG_MIN = int(os.getenv("LAG_MIN", "30"))
 
-# Intentos de fallback: t, t-15, t-30, ... (6 ⇒ 90 minutos hacia atrás).
+# Intentos de fallback: t, t-15, t-30, ... (8 ⇒ 2 horas hacia atrás).
 FALLBACKS = int(os.getenv("FALLBACKS", "8"))
 
-# Timeout de red (segundos).
+# Timeout de red por descarga (segundos).
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
+
+# Tiempo máximo que puede dedicar un /reload a probar candidatos (segundos).
+RELOAD_BUDGET_S = int(os.getenv("RELOAD_BUDGET_S", "120"))
+
+# Antigüedad (minutos desde el inicio del slot) a partir de la cual el dato servido
+# se considera desfasado. Lo normal son 32–47 min (LAG_MIN + slot de 15 min); 75 tolera
+# un slot que IPMA publique tarde sin dar la alarma.
+STALE_MIN = int(os.getenv("STALE_MIN", "75"))
+
+# Firma de un fichero HDF5 (puede ir tras un "userblock" de 512·2^n bytes).
+_HDF5_SIGNATURE = b"\x89HDF\r\n\x1a\n"
 
 # ---------------------------- Estado en memoria ---------------------------
 
 _lock = asyncio.Lock()
 _current: Optional[Dict[str, Any]] = None
 _previous: Optional[Dict[str, Any]] = None
+_last_reload: Optional[Dict[str, Any]] = None
 
 # ----------------------------- Utilidades ---------------------------------
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+def _iso(t: dt.datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _floor_to_quarter(t: dt.datetime) -> dt.datetime:
     """Redondea hacia abajo a múltiplos de 15 minutos (en UTC)."""
@@ -66,7 +86,7 @@ def _floor_to_quarter(t: dt.datetime) -> dt.datetime:
 def _ts_for_latest(now_utc: Optional[dt.datetime] = None) -> str:
     """Devuelve el ts YYYYMMDDHHMM del último slot *publicable* con LAG_MIN aplicado."""
     if now_utc is None:
-        now_utc = dt.datetime.utcnow()
+        now_utc = _utcnow()
     base = _floor_to_quarter(now_utc - dt.timedelta(minutes=LAG_MIN))
     return base.strftime("%Y%m%d%H%M")
 
@@ -83,12 +103,19 @@ def _build_url_from_ts(ts: str) -> str:
     path = f"/PRODUCTS/MSG/FRP-PIXEL/HDF5/{yyyy}/{mm}/{dd}/{fname}"
     return f"{LSA_HOST}{path}"
 
+def _looks_like_hdf5(b: bytes) -> bool:
+    return any(b[off:off + 8] == _HDF5_SIGNATURE for off in (0, 512, 1024, 2048, 4096))
+
 def _download_hdf5(url: str) -> bytes:
-    """Descarga el HDF5 (bytes) con Basic Auth opcional."""
+    """Descarga el HDF5 (bytes) con Basic Auth opcional. Falla si lo recibido no es un HDF5."""
     auth = (LSASAF_USER, LSASAF_PASS) if LSASAF_USER or LSASAF_PASS else None
     r = requests.get(url, timeout=HTTP_TIMEOUT, auth=auth)
     r.raise_for_status()
-    return r.content
+    body = r.content
+    if not _looks_like_hdf5(body):
+        ctype = r.headers.get("Content-Type", "?")
+        raise ValueError(f"respuesta_no_hdf5 (HTTP {r.status_code}, {ctype}, {len(body)} bytes)")
+    return body
 
 def _sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
@@ -96,7 +123,16 @@ def _sha256(b: bytes) -> str:
 def _slot_iso_from_ts(ts: str) -> str:
     """Devuelve el inicio de slot en ISO Zulu (p.ej. '2025-09-12T18:00:00Z')."""
     dtobj = dt.datetime.strptime(ts, "%Y%m%d%H%M").replace(tzinfo=dt.timezone.utc)
-    return dtobj.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _iso(dtobj)
+
+def _describe_error(e: Exception) -> str:
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"HTTP {e.response.status_code}"
+    if isinstance(e, requests.Timeout):
+        return "timeout"
+    if isinstance(e, requests.ConnectionError):
+        return "conexion_fallida"
+    return f"{type(e).__name__}: {e}"
 
 # ----------------------- Lectura segura de datasets -----------------------
 
@@ -170,12 +206,6 @@ def _find_datasets_by_name(f: h5py.File) -> Dict[str, h5py.Dataset]:
                 found[key] = obj
                 break
     return found
-
-def _coerce_1d(arr: np.ma.MaskedArray) -> np.ma.MaskedArray:
-    """Aplana a 1D si es posible (el List Product es 1D)."""
-    if arr.ndim == 1:
-        return arr
-    return arr.reshape(-1)
 
 def _build_rows(
     lat: np.ma.MaskedArray,
@@ -349,7 +379,7 @@ def _add_acq_time_utc(rows: List[Dict[str, Any]], slot_ts_iso: str) -> List[Dict
                 v = int(tr)
                 hh, mm = v // 100, v % 100
                 if 0 <= hh <= 23 and 0 <= mm <= 59:
-                    rr["acq_time_utc"] = base.replace(hour=hh, minute=mm).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    rr["acq_time_utc"] = _iso(base.replace(hour=hh, minute=mm))
             except Exception:
                 pass  # si no cuadra, no añadimos el campo
         out.append(rr)
@@ -374,13 +404,28 @@ def _build_snapshot(ts: str, h5bytes: bytes, bbox: Tuple[float, float, float, fl
         "ok": ok,
         "reason": (None if ok else reason),
         "slot_ts": slot_iso,
-        "downloaded_at": dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "downloaded_at": _iso(_utcnow()),
         "rows": rows_bbox,
         "count": len(rows_bbox),
         "sha256": _sha256(h5bytes),
     }
     return snap
 
+def _fetch_snapshot(ts: str) -> Dict[str, Any]:
+    """Descarga + parseo de un slot (bloqueante: llamar vía asyncio.to_thread)."""
+    return _build_snapshot(ts, _download_hdf5(_build_url_from_ts(ts)), DEFAULT_IBERIA_BBOX)
+
+# ----------------------------- Frescura -----------------------------------
+
+def snapshot_age_min(snap: Optional[Dict[str, Any]], now_utc: Optional[dt.datetime] = None) -> Optional[int]:
+    """Minutos transcurridos desde el inicio del slot del snapshot (None si no hay)."""
+    if not snap or not snap.get("slot_ts"):
+        return None
+    slot = dt.datetime.strptime(snap["slot_ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    return int(((now_utc or _utcnow()) - slot).total_seconds() // 60)
+
+def is_stale(age_min: Optional[int]) -> bool:
+    return age_min is None or age_min > STALE_MIN
 
 # -------------------------- API para FastAPI ------------------------------
 
@@ -388,50 +433,70 @@ def get_snapshot_for_serve() -> Optional[Dict[str, Any]]:
     """Devuelve el snapshot 'current' si existe; si no, 'previous'; si no, None."""
     return _current or _previous
 
+def get_last_reload() -> Optional[Dict[str, Any]]:
+    """Resumen de la última recarga (para /health)."""
+    return _last_reload
+
 async def reload_latest_async() -> Dict[str, Any]:
     """
     Descarga y publica el último slot disponible (con fallbacks). Actualiza el doble buffer.
     Reglas:
-      - Monotonía temporal (no retroceder).
+      - Solo se descargan candidatos MÁS NUEVOS que el publicado (monotonía, sin descargas inútiles).
+      - Un candidato que falla (404, timeout, fichero corrupto, slot inválido) se salta y se prueba el anterior.
       - Idempotencia por sha256.
-      - Sanidad (_sanity_checks debe pasar).
+      - ok=True si tras la recarga el dato servido sigue fresco (edad ≤ STALE_MIN), aunque haya habido
+        errores puntuales; ok=False (→ 503 y cron fallido) solo si no hay dato o está desfasado.
     """
-    global _current, _previous
+    global _current, _previous, _last_reload
     async with _lock:
-        now = dt.datetime.utcnow()
-        last_err: Optional[str] = None
-        for ts in _candidate_ts_list(now):
-            url = _build_url_from_ts(ts)
+        started = time.monotonic()
+        errores: List[str] = []
+        result: Optional[Dict[str, Any]] = None
+        cur_slot = _current["slot_ts"] if _current else None
+
+        for ts in _candidate_ts_list():
+            slot_iso = _slot_iso_from_ts(ts)
+            if cur_slot and slot_iso <= cur_slot:
+                break  # lo que queda es igual o más viejo que lo publicado
+            if time.monotonic() - started > RELOAD_BUDGET_S:
+                errores.append(f"presupuesto_agotado ({RELOAD_BUDGET_S}s)")
+                break
             try:
-                h5 = _download_hdf5(url)
+                snap = await asyncio.to_thread(_fetch_snapshot, ts)
             except Exception as e:
-                last_err = f"descarga_fallida:{e}"
+                errores.append(f"{ts}: {_describe_error(e)}")
                 continue
-            snap = _build_snapshot(ts, h5, DEFAULT_IBERIA_BBOX)
             if not snap["ok"]:
-                last_err = f"slot_invalido:{snap['reason']}"
+                errores.append(f"{ts}: slot_invalido ({snap['reason']})")
                 continue
-            # Monotonía: no retroceder
-            if _current and snap["slot_ts"] <= _current["slot_ts"]:
-                return {
-                    "ok": True,
-                    "status": "noop_monotonia",
-                    "slot_ts": _current["slot_ts"],
-                    "count": _current["count"],
-                }
-            # Idempotencia
             if _current and snap["sha256"] == _current.get("sha256"):
-                return {
-                    "ok": True,
-                    "status": "noop_idempotente",
-                    "slot_ts": _current["slot_ts"],
-                    "count": _current["count"],
-                }
-            # Conmutación atómica
+                result = {"status": "noop_idempotente"}
+                break
             _previous, _current = _current, snap
-            return {"ok": True, "status": "publicado", "slot_ts": snap["slot_ts"], "count": snap["count"]}
-        # Si llegamos aquí, no hubo candidatos válidos
-        return {"ok": False, "status": "sin_candidato_valido", "error": last_err or "descargas_fallidas"}
+            result = {"status": "publicado"}
+            break
+
+        snap = _current or _previous
+        age = snapshot_age_min(snap)
+        stale = is_stale(age)
+        if result is None:
+            if snap is None:
+                result = {"status": "sin_datos"}
+            elif stale:
+                result = {"status": "datos_desfasados"}
+            else:
+                result = {"status": "noop_monotonia"}
+        result.update({
+            "ok": not stale,
+            "slot_ts": snap["slot_ts"] if snap else None,
+            "count": snap["count"] if snap else 0,
+            "age_min": age,
+            "stale": stale,
+        })
+        if errores:
+            result["errores"] = errores
+        _last_reload = {"at": _iso(_utcnow()), **result}
+        return result
 
 async def ingest_slot_by_ts_async(
     ts: str,
@@ -445,11 +510,11 @@ async def ingest_slot_by_ts_async(
     bbox = bbox or DEFAULT_IBERIA_BBOX
     url = _build_url_from_ts(ts)
     try:
-        h5 = _download_hdf5(url)
+        h5 = await asyncio.to_thread(_download_hdf5, url)
     except Exception as e:
-        return {"ok": False, "status": "descarga_fallida", "error": str(e)}
+        return {"ok": False, "status": "descarga_fallida", "error": _describe_error(e)}
     try:
-        parsed = _parse_h5(h5)
+        parsed = await asyncio.to_thread(_parse_h5, h5)
     except Exception as e:
         return {"ok": False, "status": "parse_fallido", "error": str(e)}
     rows = _filter_bbox(parsed["rows"], bbox)
@@ -459,7 +524,7 @@ async def ingest_slot_by_ts_async(
     resp = {
         "ok": True,
         "slot_ts": slot_iso,
-        "downloaded_at": dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "downloaded_at": _iso(_utcnow()),
         "count": len(rows),
         "bbox": {"w": bbox[0], "s": bbox[1], "e": bbox[2], "n": bbox[3]},
         "rows": rows,
@@ -467,13 +532,9 @@ async def ingest_slot_by_ts_async(
     return resp
 
 async def startup_warmup():
-    """Lanza una recarga en background al iniciar el proceso (silenciosa)."""
+    """Lanza una recarga en background al iniciar el proceso (si falla, el cron lo reintenta)."""
     try:
-        await reload_latest_async()
-    except Exception:
-        # Silencioso: el cron hará /reload en minutos
-        pass
-
-
-
-
+        result = await reload_latest_async()
+        print(f"[BOOT] warmup: {result.get('status')} slot={result.get('slot_ts')} errores={result.get('errores', [])}", flush=True)
+    except Exception as e:
+        print(f"[BOOT] warmup fallido: {type(e).__name__}: {e}", flush=True)

@@ -1,6 +1,0 @@
-
----
-
-Con esto puedes **push** a GitHub y crear el **Web Service** en Render.  
-En el panel de Render añade el **cron GET** a `/reload?secret=API_KEY` cada 5 min, y MT Neo ya podrá leer siempre el **último dataset** en `JSON` sin pelearse con binarios.
-::contentReference[oaicite:0]{index=0}
