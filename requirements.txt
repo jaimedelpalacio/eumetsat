@@ -3,3 +3,4 @@ uvicorn[standard]==0.30.6
 requests==2.32.3
 h5py==3.11.0
 orjson==3.10.7
+numpy==2.3.5

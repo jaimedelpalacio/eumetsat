@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia el código
-COPY app.py ingest.py ./
+COPY app.py ingest.py mtg.py ./
 
 # Variables de entorno (puedes sobreescribir en Render)
 ENV HOST=0.0.0.0 \
