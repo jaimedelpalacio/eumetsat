@@ -8,6 +8,8 @@
 #    informa de la antigüedad del dato (age_min / stale).
 #  - /frp-pixel/by-ts descarga/parcea un slot concreto bajo demanda (NO toca el buffer).
 #  - /health informa del estado (warm/cold), el último slot, su antigüedad y la última recarga.
+#  - MTG (Meteosat-12, 1 km, cada 10 min; mtg.py): /mtg-frp/latest, /mtg-frp/by-ts y /mtg-frp/esquema, con su
+#    propio buffer recargado por un bucle interno (no depende del cron ni de /reload, que siguen siendo solo MSG).
 #
 # NOTA IMPORTANTE
 #  - El snapshot en RAM ya está recortado por el BBOX por defecto (Iberia).
@@ -41,6 +43,7 @@ from ingest import (
     DEFAULT_IBERIA_BBOX,
     STALE_MIN,
 )
+import mtg
 
 # ----------------------------- Configuración -------------------------------
 
@@ -146,12 +149,19 @@ async def root():
         f"- /reload (cabecera X-API-Key)\n"
         f"- /frp-pixel/latest?bbox=w,s,e,n&min_frp=&min_conf=\n"
         f"- /frp-pixel/by-ts?ts=YYYYMMDDHHMM&bbox=w,s,e,n&min_frp=&min_conf=\n"
+        f"- /mtg-frp/latest?bbox=w,s,e,n&min_frp=&min_conf=   (MTG, Meteosat-12, 1 km, cada 10 min)\n"
+        f"- /mtg-frp/by-ts?ts=YYYYMMDDHHMM&bbox=w,s,e,n&min_frp=&min_conf=   (ts múltiplo de 10 min; desde 2025)\n"
+        f"- /mtg-frp/esquema?ts=YYYYMMDDHHMM   (grupos y variables del fichero; cabecera X-API-Key)\n"
     )
+
+_tareas: List[asyncio.Task] = []   # tareas de fondo (warm-up de MSG, bucle de MTG)
 
 @app.on_event("startup")
 async def _on_startup():
-    # Warm-up no bloqueante (si falla, el cron lo arregla)
-    asyncio.create_task(startup_warmup())
+    # Warm-up no bloqueante (si falla, el cron lo arregla). Se guardan las referencias de las tareas.
+    _tareas.append(asyncio.create_task(startup_warmup()))
+    # MTG: bucle propio de recarga (cada MTG_RELOAD_EVERY_S); su fallo no afecta a MSG
+    _tareas.append(asyncio.create_task(mtg.reload_loop()))
 
 @app.get("/health")
 async def health():
@@ -161,8 +171,13 @@ async def health():
     Siempre 200 (el proceso está vivo); la frescura del dato va en stale/age_min.
     """
     snap = get_snapshot_for_serve()
+    ms = mtg.get_snapshot()
+    ma = mtg.age_min(ms)
+    mtg_estado = {"enabled": mtg.MTG_ENABLED, "status": "warm" if ms else "cold", "last_slot": ms.get("slot_ts") if ms else None,
+                  "count": ms.get("count", 0) if ms else 0, "age_min": ma, "stale": mtg.is_stale(ma),
+                  "stale_after_min": mtg.MTG_STALE_MIN, "last_reload": mtg.get_last_reload()}
     if not snap:
-        return {"ok": True, "status": "cold", "stale": True, "last_reload": get_last_reload()}
+        return {"ok": True, "status": "cold", "stale": True, "last_reload": get_last_reload(), "mtg": mtg_estado}
     age = snapshot_age_min(snap)
     return {
         "ok": True,
@@ -174,6 +189,7 @@ async def health():
         "stale": is_stale(age),
         "stale_after_min": STALE_MIN,
         "last_reload": get_last_reload(),
+        "mtg": mtg_estado,
     }
 
 @app.get("/reload")
@@ -268,6 +284,66 @@ async def frp_by_ts(
         except Exception:
             pass
     return ORJSONResponse(result, status_code=code)
+
+# ------------------------------ MTG (Meteosat-12) -------------------------
+
+def _check_ts_mtg(ts: str) -> None:
+    if not mtg.valid_ts(ts):
+        raise HTTPException(status_code=400, detail="ts debe ser YYYYMMDDHHMM (UTC) con minutos múltiplo de 10")
+
+@app.get("/mtg-frp/latest")
+async def mtg_latest(
+    bbox: Optional[str] = Query(default=None, description="w,s,e,n (lon/lat) para refiltrar en lectura"),
+    min_frp: Optional[float] = Query(default=None, description="umbral FRP mínimo (MW)"),
+    min_conf: Optional[float] = Query(default=None, description="umbral de confianza mínimo (0–1 o 0–100)"),
+):
+    """Último slot de MTG desde RAM (recortado a Iberia), con su antigüedad. 503 si aún no hay ninguno."""
+    snap = mtg.get_snapshot()
+    if not snap:
+        raise HTTPException(status_code=503, detail="Aún no hay slot de MTG en memoria")
+    rows = _refilter_rows(snap.get("rows", []), _parse_bbox(bbox), min_frp=min_frp, min_conf=min_conf)
+    age = mtg.age_min(snap)
+    cabeceras = {"Cache-Control": "no-cache"}               # como /frp-pixel/latest
+    if snap.get("sha256"):
+        cabeceras["ETag"] = snap["sha256"]
+    if snap.get("downloaded_at"):
+        cabeceras["Last-Modified"] = snap["downloaded_at"]
+    return ORJSONResponse(headers=cabeceras, content={
+        "ok": True, "satellite": "MTG", "slot_ts": snap.get("slot_ts"), "downloaded_at": snap.get("downloaded_at"),
+        "age_min": age, "stale": mtg.is_stale(age), "stale_after_min": mtg.MTG_STALE_MIN,
+        "bbox_used": {"w": DEFAULT_IBERIA_BBOX[0], "s": DEFAULT_IBERIA_BBOX[1],
+                      "e": DEFAULT_IBERIA_BBOX[2], "n": DEFAULT_IBERIA_BBOX[3]},
+        "count": len(rows), "count_disco": snap.get("count_disco"),
+        "source_url": mtg.build_url(_iso_to_ts(snap["slot_ts"])), "sha256": snap.get("sha256"), "rows": rows,
+    }, status_code=200)
+
+@app.get("/mtg-frp/by-ts")
+async def mtg_by_ts(
+    ts: str = Query(..., description="Timestamp del slot: YYYYMMDDHHMM (UTC), minutos múltiplo de 10"),
+    bbox: Optional[str] = Query(default=None, description="w,s,e,n (lon/lat) para filtrar el resultado"),
+    min_frp: Optional[float] = Query(default=None, description="umbral FRP mínimo (MW)"),
+    min_conf: Optional[float] = Query(default=None, description="umbral de confianza mínimo (0–1 o 0–100)"),
+):
+    """Un slot de MTG bajo demanda (NO toca el buffer). Hay datos desde el 1-ene-2025."""
+    _check_ts_mtg(ts)
+    result = await mtg.by_ts(ts, _parse_bbox(bbox), min_frp=min_frp, min_conf=min_conf)
+    if result.get("ok"):
+        result["source_url"] = mtg.build_url(ts)
+    # 404: IPMA no tiene ese slot (aún no publicado o fuera de archivo); 502: otro fallo de IPMA o del fichero
+    code = 200 if result.get("ok") else (404 if result.get("error") == "HTTP 404" else 502)
+    return ORJSONResponse(result, status_code=code)
+
+@app.get("/mtg-frp/esquema")
+async def mtg_esquema(
+    ts: str = Query(..., description="Timestamp del slot: YYYYMMDDHHMM (UTC)"),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """Grupos y variables de un fichero de MTG (producto en demostración: su formato puede cambiar)."""
+    if API_KEY and not hmac.compare_digest((x_api_key or "").encode(), API_KEY.encode()):
+        raise HTTPException(status_code=401, detail="API key inválida")
+    _check_ts_mtg(ts)
+    result = await mtg.esquema_ts(ts)
+    return ORJSONResponse(result, status_code=200 if result.get("ok") else 502)
 
 # ------------------------------ Main (dev) --------------------------------
 
