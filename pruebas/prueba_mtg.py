@@ -4,6 +4,7 @@ Atributos numéricos con forma (1,) como los guarda netCDF-C. Uso (con las depen
 """
 import asyncio
 import datetime as dt
+import gzip
 import importlib
 import io
 import os
@@ -83,8 +84,28 @@ class Resp:
             raise e
 
 
+def csv_gz(texto):
+    return gzip.compress(texto.encode("utf-8"))
+
+
+# ListProduct en CSV como el histórico de IPMA anterior a ~mayo de 2026 (formato real SIN VER: se prueba con variantes)
+CSV_OK = csv_gz("LATITUDE,LONGITUDE,FRP,FRP_UNCERTAINTY,FIRE_CONFIDENCE,PIXEL_SIZE,ABS_LINE,ABS_SAMP\n"
+                "37.2612,-7.3362,408.6,20.1,93,1.4,100,200\n"
+                "37.18,-6.90,12.3,1.0,60,1.4,101,201\n"
+                "43.8,5.0,5.5,0.5,80,1.6,102,202\n"
+                "8.0,20.0,30.0,2.0,50,1.1,103,203\n")
+
+
 def get_falso(url, timeout=None, auth=None):
     pedidas.append(url)
+    if "MTFRPPixel" in url and url.endswith(".csv.gz"):
+        if "CSV404" in estado or "404" in estado:      # «404»: IPMA no tiene ni el .nc ni el CSV
+            return Resp(404, b"no")
+        if "CSVMALO" in estado:
+            return Resp(200, csv_gz("a,b,c\n1,2,3\n"))
+        return Resp(200, CSV_OK)
+    if "MTFRPPixel" in url and "NC404" in estado:
+        return Resp(404, b"no")
     if "MTFRPPixel" in url:
         if "CAIDO" in estado:
             raise mtg.requests.ConnectionError("caido")
@@ -255,4 +276,146 @@ with TestClient(appmod.app) as cli:
     ok("mtg" in h and h["mtg"]["enabled"] is True and "status" in h and "last_slot" in h, "/health: lo de MSG igual y un bloque «mtg»")
     ok(cli.get("/frp-pixel/by-ts", params={"ts": "202611020900"}).status_code == 200, "/frp-pixel/by-ts (MSG) sin cambios")
     ok("/mtg-frp/latest" in cli.get("/").text, "la raíz lista los endpoints de MTG")
+
+print("4. Histórico en CSV comprimido (anterior a ~mayo de 2026)")
+a = mtg.leer_arrays_csv(CSV_OK)
+ok(a["frp"].size == 4 and abs(a["frp"][0] - 408.6) < 1e-9 and abs(a["conf"][0] - 0.93) < 1e-9 and abs(a["unc"][0] - 20.1) < 1e-9
+   and a["line"][2] == 102, "lee las columnas por nombre; confianza en % pasada a 0–1")
+variantes = {
+    "punto y coma, minúsculas y comillas": '"latitude";"longitude";"frp";"fire_confidence"\n"37.2612";"-7.3362";"408.6";"93"\n',
+    "cabecera con # y comentarios": "# LSA-509 ListProduct\n#LATITUDE\tLONGITUDE\tFRP\tFIRE_CONFIDENCE\n# otro comentario\n37.2612\t-7.3362\t408.6\t93\n",
+    "separado por espacios, sin confianza": "LATITUDE LONGITUDE FRP\n37.2612 -7.3362 408.6\n\n",
+    "BOM UTF-8 y CRLF": "﻿LATITUDE,LONGITUDE,FRP,FIRE_CONFIDENCE\r\n37.2612,-7.3362,408.6,0.93\r\n",
+}
+for nombre, txt in variantes.items():
+    x = mtg.leer_arrays_csv(csv_gz(txt))
+    ok(x["frp"].size == 1 and abs(x["frp"][0] - 408.6) < 1e-9 and abs(x["lat"][0] - 37.2612) < 1e-9
+       and ("conf" not in x or abs(x["conf"][0] - 0.93) < 1e-9), f"CSV: {nombre}")
+x = mtg.leer_arrays_csv(csv_gz("LATITUDE,LONGITUDE,FRP\n37.0,-7.0,\n37.1,-7.0,-999\n95,-7.0,5\n37.2,-7.0,abc\n37.3,-7.0,7.5\n37.4\n"
+                                + "".join(f"37.{i},-7.0,{i}\n" for i in range(5, 10))))
+ok(np.isnan(x["frp"][[0, 1, 3]]).all() and x["frp"][2] == 5 and abs(x["frp"][4] - 7.5) < 1e-9 and np.isnan(x["lat"][2])
+   and np.isnan(x["lon"][5]), "CSV: vacío, negativo, no numérico, lat fuera de rango y fila corta → sin dato")
+ok(len(mtg.filas(x, (-8, 36, -6, 38), "X")) == 9, "CSV: sin lat/lon no entra en el bbox (sin FRP sí, como en el .nc)")
+for nombre, b in [("sin cabecera reconocible", csv_gz("a,b,c\n1,2,3\n")), ("sin FRP", csv_gz("LATITUDE,LONGITUDE\n1,2\n")),
+                  ("gzip corrupto", b"\x1f\x8b" + b"\x00" * 30),
+                  ("columna índice sin nombre (campos desplazados)", csv_gz("LATITUDE,LONGITUDE,FRP\n0,37.26,-7.33,408.6\n1,37.3,-7.3,12\n")),
+                  ("cabecera con un nombre de dos palabras (espacios)", csv_gz("LATITUDE LONGITUDE PIXEL SIZE FRP\n37.26 -7.33 1.4 408.6\n")),
+                  ("enteros escalados", csv_gz("LATITUDE,LONGITUDE,FRP\n3726,-733,4086\n3718,-690,123\n")),
+                  ("coma decimal con punto y coma", csv_gz("LATITUDE;LONGITUDE;FRP\n37,26;-7,33;408,6\n37,18;-6,9;12,3\n"))]:
+    try:
+        mtg.leer_arrays_csv(b); ok(False, f"CSV {nombre}: debe fallar")
+    except ValueError as e:
+        ok(True, f"CSV {nombre}: falla con el texto delante ({str(e)[:70]})")
+x = mtg.leer_arrays_csv(b"FRP,FIRE_CONFIDENCE,LONGITUDE,LATITUDE\n408.6,93,-7.3362,37.2612\n")
+ok(abs(x["frp"][0] - 408.6) < 1e-9 and abs(x["lat"][0] - 37.2612) < 1e-9 and abs(x["lon"][0] + 7.3362) < 1e-9,
+   "CSV en otro orden y ya descomprimido (Content-Encoding: gzip): se lee por nombre")
+x = mtg.leer_arrays_csv(csv_gz("# columnas: LONGITUDE LATITUDE FRP\nLATITUDE,LONGITUDE,FRP\n37.2612,-7.3362,408.6\n"))
+ok(abs(x["lat"][0] - 37.2612) < 1e-9, "CSV: un comentario que nombra las columnas en otro orden no se toma como cabecera")
+ok(mtg.leer_arrays_csv(csv_gz("LATITUDE,LONGITUDE,FRP\n"))["frp"].size == 0, "CSV con solo la cabecera: válido, 0 detecciones")
+r1 = mtg.filas(mtg.leer_arrays_csv(csv_gz("LATITUDE,LONGITUDE,FRP\n37.2,-7.0,5\n")), (-8, 36, -6, 38), "X")[0]
+ok(r1["frp_unc_mw"] is None and r1["confidence"] is None and "pixel_km2" in r1,
+   "filas: las variables que el fichero no trae salen con null (mismas claves siempre)")
+ok(mtg.build_url_csv("202603151300").endswith(
+    "/PRODUCTS/MTG/MTFRPPixel/NATIVE/2026/03/15/LSA-509_MTG_MTFRPPIXEL-ListProduct_MTG-FD_202603151300.csv.gz"),
+   "URL del CSV como en el servidor de IPMA")
+with TestClient(appmod.app) as cli:
+    estado.add("NC404"); n0 = len(pedidas)
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202603151300", "bbox": "-7.45,36.95,-6.35,37.40"})
+    j = r.json()
+    ok(r.status_code == 200 and j["fuente"] == "csv.gz" and j["count"] == 2 and j["count_disco"] == 4
+       and j["source_url"].endswith(".csv.gz") and len(pedidas) - n0 == 2,
+       f"by-ts auto: el .nc da 404 → lee el CSV (2 en Huelva de 4; {len(pedidas) - n0} descargas)")
+    ok(cli.get("/mtg-frp/by-ts", params={"ts": "202603151300", "fuente": "nc"}).status_code == 404,
+       "by-ts fuente=nc: no prueba el CSV (404)")
+    estado.add("CSV404")
+    ok(cli.get("/mtg-frp/by-ts", params={"ts": "202603151300"}).status_code == 404, "by-ts auto sin .nc ni CSV: 404")
+    estado.discard("CSV404"); estado.add("CSVMALO")
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202603151300"})
+    ok(r.status_code == 502 and r.json()["status"] == "parse_fallido" and r.json()["fuente"] == "csv.gz"
+       and "a,b,c" in r.json()["error"], "by-ts con un CSV de formato desconocido: 502 y la cabecera en el error")
+    estado.discard("CSVMALO"); estado.discard("NC404"); n0 = len(pedidas)
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202609191240", "bbox": "-7.45,36.95,-6.35,37.40"})
+    ok(r.json()["fuente"] == "nc" and r.json()["count"] == 4 and len(pedidas) - n0 == 1,
+       "by-ts auto con el .nc disponible: igual que antes (no pide el CSV)")
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202609191240", "fuente": "csv", "bbox": "-7.45,36.95,-6.35,37.40"})
+    ok(r.json()["fuente"] == "csv.gz" and r.json()["count"] == 2, "by-ts fuente=csv: lee el CSV aunque haya .nc (para comparar)")
+    ok(cli.get("/mtg-frp/by-ts", params={"ts": "202609191240", "fuente": "zip"}).status_code == 400, "fuente no válida: 400")
+    estado.add("NC404"); estado.add("CAIDO_CSV")
+    mtg.requests.get, original = (lambda url, timeout=None, auth=None: (_ for _ in ()).throw(mtg.requests.ConnectionError("caido"))
+                                  if url.endswith(".csv.gz") else get_falso(url, timeout, auth)), mtg.requests.get
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202603151300"})
+    ok(r.status_code == 502 and r.json()["status"] == "descarga_fallida" and len(r.json()["intentado"]) == 2
+       and r.json()["intentado"][1].endswith(".csv.gz"), "by-ts: .nc 404 y CSV caído → 502, con las URL intentadas")
+    mtg.requests.get = original; estado.discard("CAIDO_CSV")
+    estado.discard("NC404"); estado.add("401")
+    n0 = len(pedidas)
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202603151300"})
+    ok(r.status_code == 502 and len(pedidas) - n0 == 1, "by-ts con la cuenta rechazada (401): no prueba el CSV")
+    estado.discard("401"); estado.add("NC404")
+    r = cli.get("/mtg-frp/esquema", params={"ts": "202603151300"}, headers={"X-API-Key": "clave-prueba"})
+    ok(r.status_code == 200 and r.json()["csv"] and r.json()["primeras_lineas"][0].startswith("LATITUDE,")
+       and r.json()["lineas"] == 5, "esquema del CSV: sus primeras líneas")
+    estado.discard("NC404")
+    r = cli.get("/mtg-frp/esquema", params={"ts": "202609191240", "fuente": "nc"}, headers={"X-API-Key": "clave-prueba"})
+    ok(r.status_code == 200 and r.json()["hdf5"] and r.json()["fuente"] == "nc", "esquema del .nc igual que antes")
+    n0 = len(pedidas)
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "203001011200"})
+    ok(r.status_code == 404 and len(pedidas) == n0, "by-ts de un slot futuro: 404 sin pedir nada a IPMA")
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202412311200"})
+    ok(r.status_code == 404 and len(pedidas) == n0, "by-ts anterior al archivo (2025): 404 sin pedir nada a IPMA")
+    r = cli.get("/mtg-frp/esquema", params={"ts": "203001011200"}, headers={"X-API-Key": "clave-prueba"})
+    ok(r.status_code == 404 and len(pedidas) == n0, "esquema de un slot futuro: 404 sin pedir nada a IPMA")
+    estado.add("NC404")
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202609191240"})
+    ok(r.status_code == 404 and len(pedidas) - n0 == 1, "by-ts auto posterior a MTG_CSV_HASTA con el .nc en 404: no prueba el CSV")
+    estado.discard("NC404"); estado.add("CSVMALO")
+    n0 = len(pedidas)
+    r = cli.get("/mtg-frp/by-ts", params={"ts": "202609191240", "fuente": "csv"})
+    ok(r.status_code == 502 and "cabecera" in r.json()["error"], "by-ts fuente=csv se puede pedir siempre (para comparar)")
+    estado.discard("CSVMALO")
+    m = asyncio.run(mtg.reload_latest()); n0 = len(pedidas)
+    estado.add("NC404"); mtg._current = mtg._previous = None
+    hasta, mtg.MTG_CSV_HASTA = mtg.MTG_CSV_HASTA, "209901010000"   # que auto SÍ probaría el CSV para estos slots
+    asyncio.run(mtg.reload_latest())
+    ok(len(pedidas) > n0 and not any(u.endswith(".csv.gz") for u in pedidas[n0:]),
+       "el bucle de recarga no pide nunca el CSV (aunque auto lo probaría para esos slots)")
+    mtg.MTG_CSV_HASTA = hasta
+    estado.discard("NC404")
+
+print("5. Formatos y escalas dudosos del CSV (segunda revisión)")
+x = mtg.leer_arrays_csv(csv_gz("LATITUDE,LONGITUDE,FRP_UNCERTAINTY,FRP,FIRE_CONFIDENCE\n37.2,-7.0,1.5,40.5,80\n37.3,-7.0,2.5,30.5,70\n"
+                               "37.9,-7.0,700,80\n37.4,-7.0,1.0,20.5,90,texto,suelto\n"))
+ok(abs(x["frp"][0] - 40.5) < 1e-9 and np.isnan(x["frp"][2]) and np.isnan(x["unc"][2]) and np.isnan(x["frp"][3])
+   and np.nanmax(x["conf"]) <= 1, "fila corta o con campos de más: entera sin dato (nunca leída por posición)")
+x = mtg.leer_arrays_csv(csv_gz('LATITUDE,LONGITUDE,FRP,"PIXEL SIZE, km2"\n37.2,-7.0,40.5,1.4\n'))
+ok(abs(x["frp"][0] - 40.5) < 1e-9, "cabecera con un nombre entre comillas que lleva el separador")
+x = mtg.leer_arrays_csv(csv_gz("LATITUDE,LONGITUDE,FRP,\n37.2,-7.0,40.5\n37.3,-7.0,30.5,\n"))
+ok(x["frp"].size == 2 and abs(x["frp"][1] - 30.5) < 1e-9, "separador al final de la cabecera, con o sin él en las filas")
+veinte = lambda frp, conf: csv_gz("LATITUDE,LONGITUDE,FRP,FIRE_CONFIDENCE\n" +
+                                  "".join(f"37.{i:02d},-7.0,{frp(i)},{conf(i)}\n" for i in range(20)))
+for nombre, b in [("FRP en vatios", veinte(lambda i: 408600000 + i, lambda i: 80)),
+                  ("FRP todo enteros (escalado ×10)", veinte(lambda i: 4086 + i, lambda i: 80)),
+                  ("confianza 0–10000", veinte(lambda i: 40.5 + i, lambda i: 9300)),
+                  ("confianza en clases 1–3", veinte(lambda i: 40.5 + i, lambda i: 1 + i % 3)),
+                  ("datos antes de la cabecera", csv_gz("# LATITUDE,LONGITUDE,FRP\n37.2,-7.0,40.5\nLATITUDE,LONGITUDE,FRP\n"))]:
+    try:
+        mtg.leer_arrays_csv(b); ok(False, f"CSV {nombre}: debe fallar")
+    except ValueError as e:
+        ok(True, f"CSV {nombre}: falla ({str(e)[:70]})")
+ok(mtg.leer_arrays_csv(veinte(lambda i: 40.5 + i, lambda i: 50 + i))["frp"].size == 20, "20 filas normales: se leen")
+roto = bytearray(csv_gz("LATITUDE,LONGITUDE,FRP\n" * 50)); roto[12:20] = b"\xff" * 8
+for nombre, b in [("gzip con datos dañados (zlib.error)", bytes(roto)),
+                  ("confianza 0–1 con un valor > 1", csv_gz("LATITUDE,LONGITUDE,FRP,FIRE_CONFIDENCE\n37.2,-7,40.5,0.9\n37.3,-7,30.5,0.8\n37.4,-7,20.5,1.5\n")),
+                  ("relleno -1 en la confianza", csv_gz("LATITUDE,LONGITUDE,FRP,FIRE_CONFIDENCE\n37.2,-7,40.5,80\n37.3,-7,30.5,-1\n"))]:
+    try:
+        mtg.leer_arrays_csv(b); ok(False, f"CSV {nombre}: debe fallar")
+    except ValueError as e:
+        ok(True, f"CSV {nombre}: falla ({str(e)[:70]})")
+x = mtg.leer_arrays_csv(csv_gz("LATITUDE,LONGITUDE,FRP,FRP_UNCERTAINTY,PIXEL_SIZE\n37.2,-7,40.5,-999,-1\n"))
+ok(np.isnan(x["unc"][0]) and np.isnan(x["area"][0]) and abs(x["frp"][0] - 40.5) < 1e-9, "relleno negativo en incertidumbre y área → sin dato")
+os.environ["MTG_CSV_HASTA"] = "2026-07-01"
+m3 = importlib.reload(mtg)
+ok(m3.MTG_CSV_HASTA == "202607010000", "MTG_CSV_HASTA mal escrita: valor por defecto")
+del os.environ["MTG_CSV_HASTA"]
+mtg = importlib.reload(mtg)
 print("RESULTADO:", "OK" if not fallos else f"{fallos} FALLOS")
