@@ -10,6 +10,7 @@
 #  - /health informa del estado (warm/cold), el último slot, su antigüedad y la última recarga.
 #  - MTG (Meteosat-12, 1 km, cada 10 min; mtg.py): /mtg-frp/latest, /mtg-frp/by-ts y /mtg-frp/esquema, con su
 #    propio buffer recargado por un bucle interno (no depende del cron ni de /reload, que siguen siendo solo MSG).
+#    /mtg-frp/by-ts lee también el histórico anterior a ~mayo de 2026, que IPMA solo tiene en CSV comprimido.
 #
 # NOTA IMPORTANTE
 #  - El snapshot en RAM ya está recortado por el BBOX por defecto (Iberia).
@@ -150,8 +151,8 @@ async def root():
         f"- /frp-pixel/latest?bbox=w,s,e,n&min_frp=&min_conf=\n"
         f"- /frp-pixel/by-ts?ts=YYYYMMDDHHMM&bbox=w,s,e,n&min_frp=&min_conf=\n"
         f"- /mtg-frp/latest?bbox=w,s,e,n&min_frp=&min_conf=   (MTG, Meteosat-12, 1 km, cada 10 min)\n"
-        f"- /mtg-frp/by-ts?ts=YYYYMMDDHHMM&bbox=w,s,e,n&min_frp=&min_conf=   (ts múltiplo de 10 min; desde 2025)\n"
-        f"- /mtg-frp/esquema?ts=YYYYMMDDHHMM   (grupos y variables del fichero; cabecera X-API-Key)\n"
+        f"- /mtg-frp/by-ts?ts=YYYYMMDDHHMM&bbox=w,s,e,n&min_frp=&min_conf=&fuente=auto|nc|csv   (ts múltiplo de 10 min; desde 2025)\n"
+        f"- /mtg-frp/esquema?ts=YYYYMMDDHHMM&fuente=auto|nc|csv   (grupos y variables del fichero; cabecera X-API-Key)\n"
     )
 
 _tareas: List[asyncio.Task] = []   # tareas de fondo (warm-up de MSG, bucle de MTG)
@@ -291,6 +292,10 @@ def _check_ts_mtg(ts: str) -> None:
     if not mtg.valid_ts(ts):
         raise HTTPException(status_code=400, detail="ts debe ser YYYYMMDDHHMM (UTC) con minutos múltiplo de 10")
 
+def _check_fuente(fuente: str) -> None:
+    if fuente not in mtg.FUENTES:
+        raise HTTPException(status_code=400, detail=f"fuente debe ser una de: {', '.join(mtg.FUENTES)}")
+
 @app.get("/mtg-frp/latest")
 async def mtg_latest(
     bbox: Optional[str] = Query(default=None, description="w,s,e,n (lon/lat) para refiltrar en lectura"),
@@ -323,12 +328,15 @@ async def mtg_by_ts(
     bbox: Optional[str] = Query(default=None, description="w,s,e,n (lon/lat) para filtrar el resultado"),
     min_frp: Optional[float] = Query(default=None, description="umbral FRP mínimo (MW)"),
     min_conf: Optional[float] = Query(default=None, description="umbral de confianza mínimo (0–1 o 0–100)"),
+    fuente: str = Query(default="auto", description="auto (el .nc y, si da 404, el CSV), nc o csv"),
 ):
-    """Un slot de MTG bajo demanda (NO toca el buffer). Hay datos desde el 1-ene-2025."""
+    """Un slot de MTG bajo demanda (NO toca el buffer). Hay datos desde el 1-ene-2025; antes de ~mayo de 2026 solo en
+    CSV comprimido, que fuente=auto coge si el .nc no está."""
     _check_ts_mtg(ts)
-    result = await mtg.by_ts(ts, _parse_bbox(bbox), min_frp=min_frp, min_conf=min_conf)
+    _check_fuente(fuente)
+    result = await mtg.by_ts(ts, _parse_bbox(bbox), min_frp=min_frp, min_conf=min_conf, fuente=fuente)
     if result.get("ok"):
-        result["source_url"] = mtg.build_url(ts)
+        result["source_url"] = mtg.build_url(ts) if result.get("fuente") == "nc" else mtg.build_url_csv(ts)
     # 404: IPMA no tiene ese slot (aún no publicado o fuera de archivo); 502: otro fallo de IPMA o del fichero
     code = 200 if result.get("ok") else (404 if result.get("error") == "HTTP 404" else 502)
     return ORJSONResponse(result, status_code=code)
@@ -336,14 +344,18 @@ async def mtg_by_ts(
 @app.get("/mtg-frp/esquema")
 async def mtg_esquema(
     ts: str = Query(..., description="Timestamp del slot: YYYYMMDDHHMM (UTC)"),
+    fuente: str = Query(default="auto", description="auto (el .nc y, si da 404, el CSV), nc o csv"),
     x_api_key: Optional[str] = Header(default=None),
 ):
-    """Grupos y variables de un fichero de MTG (producto en demostración: su formato puede cambiar)."""
+    """Grupos y variables de un fichero de MTG (producto en demostración: su formato puede cambiar); del CSV, sus
+    primeras líneas."""
     if API_KEY and not hmac.compare_digest((x_api_key or "").encode(), API_KEY.encode()):
         raise HTTPException(status_code=401, detail="API key inválida")
     _check_ts_mtg(ts)
-    result = await mtg.esquema_ts(ts)
-    return ORJSONResponse(result, status_code=200 if result.get("ok") else 502)
+    _check_fuente(fuente)
+    result = await mtg.esquema_ts(ts, fuente=fuente)
+    code = 200 if result.get("ok") else (404 if result.get("error") == "HTTP 404" else 502)
+    return ORJSONResponse(result, status_code=code)
 
 # ------------------------------ Main (dev) --------------------------------
 
